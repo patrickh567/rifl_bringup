@@ -1,0 +1,23 @@
+# Generated Vivado projects (recreated by `make create_rifl_project`)
+# NB: match the project dir + its sidecar dirs only -- NOT vu47p_rifl_project.tcl
+/vu47p_rifl/
+/vu47p_rifl.*
+/vu47p_test/
+/vu47p_test.*
+
+# Vivado / simulator artifacts
+vivado*
+hs_err*
+webtalk*
+.Xil
+xsim.dir
+*.jou
+*.log
+*.pb
+*.wdb
+*.str
+
+# IP output products are regenerated; only the .xci configs are tracked
+xci/**
+!xci/**/
+!xci/**/*.xci

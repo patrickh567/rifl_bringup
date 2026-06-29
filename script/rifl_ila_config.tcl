@@ -1,0 +1,21 @@
+set_property TRIGGER_COMPARE_VALUE neq16'h0000 [get_hw_probes {nm[*].design_ila_axis_debug_0/m_axis_counter_tkeep_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq16'h0000 [get_hw_probes {nm[*].design_ila_axis_debug_0/s_axis_counter_tkeep_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_init_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_send_pause_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_pause_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_send_retrans_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_retrans_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'hF [get_hw_probes {nm[*].design_ila_axis_debug_0/tx_state_normal_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'hF [get_hw_probes {nm[*].design_ila_axis_debug_0/rx_up_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'hF [get_hw_probes {nm[*].design_ila_axis_debug_0/rx_aligned_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/rx_error_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/rx_pause_request_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/rx_retrans_request_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/local_fc_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE neq4'h0 [get_hw_probes {nm[*].design_ila_axis_debug_0/remote_fc_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property CONTROL.TRIGGER_CONDITION OR [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]
+
+
+
+set_property TRIGGER_COMPARE_VALUE eq4'hX [get_hw_probes {nm[*].design_ila_axis_debug_0/local_fc_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
+set_property TRIGGER_COMPARE_VALUE eq4'hX [get_hw_probes {nm[*].design_ila_axis_debug_0/remote_fc_1} -of_objects [get_hw_ilas -of_objects [get_hw_devices xcvu47p_0] -filter {CELL_NAME=~"nm[*].design_ila_axis_debug_0/ila_0"}]]
