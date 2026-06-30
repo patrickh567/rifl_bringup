@@ -4,34 +4,41 @@
 // -----------------------------------------------------------------------------
 // axi_full_to_axis_fifo
 //
-// AXI4 (full) write slave  ->  FIFO  ->  AXI-Stream master.
+// AXI4 (full) write slave  ->  data FIFO + descriptor FIFO  ->  AXI-Stream master.
 //
-//   * Every AXI write data beat (WVALID & WREADY) is pushed into the FIFO.
-//     WLAST is IGNORED for framing -- it is used only to return the AXI write
-//     response (one B per write burst).
-//   * The AXI-Stream side drains the FIFO only while axis_enable is high.
-//     One word is dequeued per accepted beat (TVALID & TREADY).
-//   * TLAST is asserted on the beat that empties the FIFO -- i.e. when the word
-//     being dequeued is the last one currently in the FIFO (occupancy == 1).
+// Packet framing is DESCRIPTOR-DRIVEN, so software can buffer several variable-size
+// packets and have them drain as distinct AXIS packets ("load many, then enable"):
+//   * WRITE with awaddr[COMMIT_BIT]==0  -> DATA: each W beat pushes one word into
+//     the data FIFO and increments the running length wr_len.
+//   * WRITE with awaddr[COMMIT_BIT]==1  -> COMMIT: on its last beat, push wr_len
+//     (the just-written packet's beat-count) into the descriptor FIFO and reset
+//     wr_len.  No data is pushed; a zero-length commit is dropped.
+//   * The AXI-Stream side drains only while axis_enable is high.  A small FSM pops
+//     a length L from the descriptor FIFO and emits exactly L beats, asserting
+//     TLAST on the L-th (rem==1), then pops the next descriptor.  So each buffered
+//     packet leaves with its own correct TLAST boundary.
 //
-// Single clock domain (aclk).  The FIFO is first-word-fall-through (the head is
-// presented combinationally) so the occupancy->TLAST decision is exact.
+// AW/W handshake: one outstanding write.  AW is accepted (awready=~aw_active) and
+// its awaddr[COMMIT_BIT] latched; WREADY is held low until that AW is registered
+// (removes AW/W skew) and is gated by ~fifo_full (data) or ~desc_full (commit), so
+// neither FIFO overflows and the data and descriptor streams never desynchronize.
+// One OKAY B response per write burst (per accepted WLAST).
 //
-// The AXI read channel is unused; it safely returns arlen+1 zero beats so a
-// master that issues reads never hangs.
-//
-// Note: with concurrent writes during a drain, "occupancy == 1" can recur, so
-// TLAST is only a clean single packet boundary in the intended fill-then-drain
-// use (stop writing, then raise axis_enable to release the buffered packet).
+// Single clock domain (aclk).  FWFT FIFOs (head read combinationally).
+// The AXI read channel is unused; it returns arlen+1 zero beats so reads never hang.
 // -----------------------------------------------------------------------------
 module axi_full_to_axis_fifo #
 (
     parameter integer AXI_DATA_WIDTH = 256
   , parameter integer AXI_ADDR_WIDTH = 32
-  , parameter integer FIFO_DEPTH     = 512          // power of two, >= 2
+  , parameter integer FIFO_DEPTH     = 512          // data FIFO, power of two, >= 2
+  , parameter integer DESC_DEPTH     = 64           // descriptor FIFO (max buffered packets)
+  , parameter integer COMMIT_BIT     = 15           // awaddr bit: 1 => commit a packet
   , localparam integer STRB_WIDTH    = AXI_DATA_WIDTH/8
   , localparam integer PTR_WIDTH     = $clog2(FIFO_DEPTH)
   , localparam integer CNT_WIDTH     = $clog2(FIFO_DEPTH) + 1
+  , localparam integer DPTR_WIDTH    = $clog2(DESC_DEPTH)
+  , localparam integer DCNT_WIDTH    = $clog2(DESC_DEPTH) + 1
 )
 (
     input  wire                       aclk
@@ -52,7 +59,7 @@ module axi_full_to_axis_fifo #
   // ---- write data channel ----
   , input  wire [AXI_DATA_WIDTH-1:0]  s_axi_wdata
   , input  wire [STRB_WIDTH-1:0]      s_axi_wstrb       // ignored
-  , input  wire                       s_axi_wlast       // ignored for framing
+  , input  wire                       s_axi_wlast
   , input  wire                       s_axi_wvalid
   , output wire                       s_axi_wready
   // ---- write response channel ----
@@ -84,10 +91,13 @@ module axi_full_to_axis_fifo #
   , output wire                       m_axis_tlast
   , output wire                       m_axis_tvalid
   , input  wire                       m_axis_tready
+
+  // ---- descriptor FIFO occupancy (packets buffered, ready to drain) ----
+  , output wire [DCNT_WIDTH-1:0]      desc_count_o
 );
 
   // ---------------------------------------------------------------------------
-  // FIFO storage (first-word-fall-through: head read combinationally)
+  // Data FIFO (first-word-fall-through)
   // ---------------------------------------------------------------------------
   (* ram_style = "distributed" *)
   logic [AXI_DATA_WIDTH-1:0] mem [FIFO_DEPTH-1:0];
@@ -98,16 +108,76 @@ module axi_full_to_axis_fifo #
   wire fifo_full  = (count == FIFO_DEPTH);
   wire fifo_empty = (count == 0);
 
-  // ---- write data -> FIFO ----
-  assign s_axi_wready = ~fifo_full;
-  wire   push         = s_axi_wvalid & s_axi_wready;
+  // ---------------------------------------------------------------------------
+  // Descriptor FIFO (per-packet beat-count, FWFT)
+  // ---------------------------------------------------------------------------
+  (* ram_style = "distributed" *)
+  logic [CNT_WIDTH-1:0]  desc_mem [DESC_DEPTH-1:0];
+  logic [DPTR_WIDTH-1:0] dwptr;
+  logic [DPTR_WIDTH-1:0] drptr;
+  logic [DCNT_WIDTH-1:0] dcount;
 
-  // ---- AXI-Stream drain ----
-  assign m_axis_tvalid = axis_enable & ~fifo_empty;
+  wire desc_full  = (dcount == DESC_DEPTH);
+  wire desc_empty = (dcount == 0);
+  wire [CNT_WIDTH-1:0] desc_head = desc_mem[drptr];
+  assign desc_count_o = dcount;
+
+  // ---------------------------------------------------------------------------
+  // AW / W : one outstanding write; decode commit-vs-data on awaddr[COMMIT_BIT]
+  // ---------------------------------------------------------------------------
+  logic aw_active;       // an AW is accepted; its W beats may flow
+  logic is_commit_q;     // latched awaddr[COMMIT_BIT] of the current AW
+
+  assign s_axi_awready = ~aw_active;
+  wire   aw_fire = s_axi_awvalid & s_axi_awready;
+
+  // W flows only after its AW is registered: data gated by ~fifo_full, commit by ~desc_full
+  assign s_axi_wready = aw_active & (is_commit_q ? ~desc_full : ~fifo_full);
+  wire   w_fire = s_axi_wvalid & s_axi_wready;
+  wire   push   = w_fire & ~is_commit_q;                 // data beat -> data FIFO
+  wire   commit = w_fire &  is_commit_q & s_axi_wlast;   // end of a commit transaction
+
+  // running beat-count of the packet currently being written
+  logic [CNT_WIDTH-1:0] wr_len;
+  wire   desc_push = commit & (wr_len != 0);             // drop zero-length commits
+
+  always_ff @(posedge aclk) begin
+    if (~aresetn) begin
+      aw_active   <= 1'b0;
+      is_commit_q <= 1'b0;
+    end else if (aw_fire) begin
+      aw_active   <= 1'b1;
+      is_commit_q <= s_axi_awaddr[COMMIT_BIT];
+    end else if (w_fire & s_axi_wlast) begin
+      aw_active   <= 1'b0;                               // transaction complete
+    end
+  end
+
+  always_ff @(posedge aclk) begin
+    if (~aresetn)    wr_len <= '0;
+    else if (commit) wr_len <= '0;                       // reset after committing
+    else if (push)   wr_len <= wr_len + 1'b1;
+  end
+
+  // ---------------------------------------------------------------------------
+  // Drain FSM : pop a length L (only while enabled), emit L beats, TLAST on L-th.
+  // ---------------------------------------------------------------------------
+  logic [CNT_WIDTH-1:0] rem;                            // beats left in current packet
+  wire   desc_pop = (rem == 0) & ~desc_empty & axis_enable;   // start next packet
+
+  assign m_axis_tvalid = axis_enable & (rem != 0) & ~fifo_empty;
   assign m_axis_tdata  = mem[rptr];
-  assign m_axis_tlast  = m_axis_tvalid & (count == 1);
+  assign m_axis_tlast  = (rem == 1);
   wire   pop           = m_axis_tvalid & m_axis_tready;
 
+  always_ff @(posedge aclk) begin
+    if (~aresetn)       rem <= '0;
+    else if (rem == 0) begin
+      if (desc_pop)     rem <= desc_head;
+    end else if (pop)   rem <= rem - 1'b1;
+  end
+
+  // ---- data FIFO pointers / count ----
   always_ff @(posedge aclk) begin
     if (~aresetn) begin
       wptr  <= '0;
@@ -128,15 +198,32 @@ module axi_full_to_axis_fifo #
     end
   end
 
-  // ---------------------------------------------------------------------------
-  // AXI write address + response.  AW is accepted and its address ignored
-  // (the FIFO is address-agnostic).  One B response is returned per write burst
-  // (per accepted WLAST).  Assumes a bounded number of outstanding writes.
-  // ---------------------------------------------------------------------------
-  assign s_axi_awready = 1'b1;
+  // ---- descriptor FIFO pointers / count ----
+  always_ff @(posedge aclk) begin
+    if (~aresetn) begin
+      dwptr  <= '0;
+      drptr  <= '0;
+      dcount <= '0;
+    end else begin
+      if (desc_push) begin
+        desc_mem[dwptr] <= wr_len;
+        dwptr           <= dwptr + 1'b1;
+      end
+      if (desc_pop)
+        drptr <= drptr + 1'b1;
+      case ({desc_push, desc_pop})
+        2'b10:   dcount <= dcount + 1'b1;
+        2'b01:   dcount <= dcount - 1'b1;
+        default: dcount <= dcount;
+      endcase
+    end
+  end
 
-  logic [7:0] bcount;                       // outstanding B responses to send
-  wire  wlast_beat = push & s_axi_wlast;
+  // ---------------------------------------------------------------------------
+  // AXI write response : one OKAY B per write burst (per accepted WLAST).
+  // ---------------------------------------------------------------------------
+  logic [7:0] bcount;
+  wire  wlast_beat = w_fire & s_axi_wlast;               // covers data AND commit
   wire  b_fire     = s_axi_bvalid & s_axi_bready;
 
   always_ff @(posedge aclk) begin
@@ -151,7 +238,7 @@ module axi_full_to_axis_fifo #
   end
 
   assign s_axi_bvalid = (bcount != 8'd0);
-  assign s_axi_bresp  = 2'b00;              // OKAY
+  assign s_axi_bresp  = 2'b00;             // OKAY
 
   // ---------------------------------------------------------------------------
   // AXI read channel : unused.  Accept any read and return arlen+1 zero beats.
@@ -161,7 +248,7 @@ module axi_full_to_axis_fifo #
 
   assign s_axi_arready = ~r_busy;
   assign s_axi_rdata   = '0;
-  assign s_axi_rresp   = 2'b00;             // OKAY
+  assign s_axi_rresp   = 2'b00;            // OKAY
   assign s_axi_rvalid  = r_busy;
   assign s_axi_rlast   = r_busy & (r_remaining == 8'd0);
 

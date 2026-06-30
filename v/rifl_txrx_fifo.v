@@ -4,19 +4,24 @@
 // -----------------------------------------------------------------------------
 // rifl_txrx_fifo
 //
-// Combined per-link TX + RX FIFOs sharing ONE AXI4 (full) slave port:
-//   * AXI WRITE channel (AW/W/B) -> TX FIFO (axi_full_to_axis_fifo) -> RIFL s_axis.
-//   * AXI READ channel (AR/R)  -> address-decoded between two RX FIFOs:
-//       s_axi_araddr[DECODE_BIT] == 0 -> RX data FIFO  (axis_to_axi_full_fifo),
-//                                        holds RIFL m_axis tdata (one word/beat);
-//       s_axi_araddr[DECODE_BIT] == 1 -> RX tkeep FIFO (tkeep_pack_fifo), holds
-//                                        packed m_axis tkeep (8 chunks/word).
+// Combined per-link TX + RX FIFOs sharing ONE AXI4 (full) slave port.
 //
-// Each RIFL RX beat is forked into BOTH RX FIFOs (data word + tkeep chunk) and is
-// accepted only when both have room.  Reads are serialized (one burst at a time)
-// through the read demux -- fine for the JTAG-AXI master.
+//   TX (writes):  awaddr[15]==0       -> push a data word into the TX data FIFO;
+//                 awaddr[15]==1 (+0x8000) -> COMMIT: record the just-written
+//                 packet's beat-count in the TX descriptor FIFO.  Raising
+//                 tx_axis_enable drains every buffered packet to the RIFL s_axis
+//                 with TLAST at each descriptor boundary (axi_full_to_axis_fifo).
 //
-// Single clock domain (aclk = the link's rifl_usr_clk).
+//   RX (reads), demuxed by araddr[15:14]:
+//                 0x (0x0)    -> RX data  FIFO  (axis_to_axi_full_fifo)
+//                 10 (0x8000) -> RX tkeep FIFO  (tkeep_pack_fifo, 8 chunks/word)
+//                 11 (0xC000) -> RX length FIFO (axis_to_axi_full_fifo): one entry
+//                                per received packet = its beat-count, so software
+//                                can read packets back boundary-aware.
+//
+// Each RIFL RX beat is forked into the data + tkeep FIFOs (and, on its TLAST beat,
+// the length FIFO) and is accepted only when every target it feeds has room.
+// Reads are serialized (one burst at a time).  Single clock domain (rifl_usr_clk).
 // -----------------------------------------------------------------------------
 module rifl_txrx_fifo #
 (
@@ -25,17 +30,21 @@ module rifl_txrx_fifo #
   , parameter integer TX_FIFO_DEPTH  = 512
   , parameter integer RX_FIFO_DEPTH  = 512
   , parameter integer TK_FIFO_DEPTH  = 512
-  , parameter integer DECODE_BIT     = 15        // araddr bit: 0 = RX data, 1 = RX tkeep
+  , parameter integer TX_DESC_DEPTH  = 64        // TX descriptor FIFO (max buffered TX packets)
+  , parameter integer RX_PKT_DEPTH   = 64        // RX length FIFO (max buffered RX packet lengths)
+  , parameter integer DECODE_BIT     = 15        // read sel = araddr[15:14]: 0x=data,10=tkeep,11=len
   , localparam integer STRB_WIDTH    = AXI_DATA_WIDTH/8
   , localparam integer TKEEP_W       = AXI_DATA_WIDTH/8
   , localparam integer RX_CNT_WIDTH  = $clog2(RX_FIFO_DEPTH) + 1
   , localparam integer TK_CNT_WIDTH  = $clog2(TK_FIFO_DEPTH) + 1
+  , localparam integer TX_DESC_CNT_W = $clog2(TX_DESC_DEPTH) + 1
+  , localparam integer RX_PKT_CNT_W  = $clog2(RX_PKT_DEPTH) + 1
 )
 (
     input  wire                       aclk
   , input  wire                       aresetn
 
-  // ---- shared AXI4 (full) slave: writes -> TX, reads -> RX data/tkeep ----
+  // ---- shared AXI4 (full) slave: writes -> TX, reads -> RX data/tkeep/length ----
   , input  wire [AXI_ADDR_WIDTH-1:0]  s_axi_awaddr
   , input  wire [7:0]                 s_axi_awlen
   , input  wire [2:0]                 s_axi_awsize
@@ -86,9 +95,11 @@ module rifl_txrx_fifo #
   , input  wire                       s_axis_tvalid
   , output wire                       s_axis_tready
 
-  // ---- occupancies (words available to read) ----
-  , output wire [RX_CNT_WIDTH-1:0]    rx_count_o      // RX data FIFO
-  , output wire [TK_CNT_WIDTH-1:0]    tkeep_count_o   // RX tkeep FIFO (packed words)
+  // ---- occupancies ----
+  , output wire [RX_CNT_WIDTH-1:0]    rx_count_o       // RX data FIFO (words)
+  , output wire [TK_CNT_WIDTH-1:0]    tkeep_count_o    // RX tkeep FIFO (packed words)
+  , output wire [TX_DESC_CNT_W-1:0]   tx_desc_count_o  // TX descriptor FIFO (packets buffered)
+  , output wire [RX_PKT_CNT_W-1:0]    rx_pkt_count_o   // RX length FIFO (packets received)
 );
 
   // ---------------------------------------------------------------------------
@@ -107,26 +118,46 @@ module rifl_txrx_fifo #
   );
 
   // ---------------------------------------------------------------------------
-  // RX beat fork: each accepted RIFL RX beat feeds both RX FIFOs (data + tkeep).
+  // RX beat fork: each accepted RIFL RX beat feeds the data + tkeep FIFOs, and on
+  // its TLAST beat also pushes the packet length into the RX length FIFO.  The
+  // beat is accepted only when every target it feeds has room (length only needed
+  // on a TLAST beat) so the three streams stay in lockstep.
   // ---------------------------------------------------------------------------
-  wire rxd_tready, tk_tready;
-  assign r_tready = rxd_tready & tk_tready;
-  wire rxd_tvalid = r_tvalid & tk_tready;   // present to data FIFO only if tkeep also ready
-  wire tk_tvalid  = r_tvalid & rxd_tready;
+  wire rxd_tready, tk_tready, len_in_ready;
+  wire len_ok = ~(r_tvalid & r_tlast) | len_in_ready;     // length-FIFO room on TLAST beats only
+  assign r_tready = rxd_tready & tk_tready & len_ok;
+  wire rxd_tvalid = r_tvalid & tk_tready & len_ok;         // data push when tkeep (+len) ready
+  wire tk_tvalid  = r_tvalid & rxd_tready & len_ok;        // tkeep push when data (+len) ready
+  wire len_push   = r_tvalid & r_tlast & rxd_tready & tk_tready;  // FIFO tready gates the push
+
+  // packet-length counter (value, up to RX_FIFO_DEPTH beats) for the RX length FIFO
+  wire fork_fire = r_tvalid & r_tready;
+  logic [RX_CNT_WIDTH-1:0] rx_len;                         // prior beats in the current RX packet
+  always_ff @(posedge aclk) begin
+    if (~aresetn)       rx_len <= '0;
+    else if (fork_fire) rx_len <= r_tlast ? '0 : (rx_len + 1'b1);
+  end
+  wire [AXI_DATA_WIDTH-1:0] len_din = AXI_DATA_WIDTH'(rx_len + 1'b1);  // include the TLAST beat
 
   // ---------------------------------------------------------------------------
-  // AXI read demux: route AR/R to the data or tkeep FIFO by araddr[DECODE_BIT].
+  // AXI read demux: route AR/R to data / tkeep / length FIFO by araddr[15:14].
+  // Backward compatible: data at 0x0, tkeep at 0x8000, length at 0xC000.
   // Serialized: accept a new AR only when no read burst is in flight.
   // ---------------------------------------------------------------------------
-  wire ar_sel = s_axi_araddr[DECODE_BIT];        // 0 = data, 1 = tkeep
-  logic rd_active, r_sel;
-  wire  ar_fire     = s_axi_arvalid & s_axi_arready;
-  wire  rlast_fire  = s_axi_rvalid  & s_axi_rready & s_axi_rlast;
+  wire [1:0] ar_sel  = s_axi_araddr[DECODE_BIT -: 2];      // [15:14]
+  wire ar_is_data = ~ar_sel[1];                            // 0x0000-0x7FFF
+  wire ar_is_tk   = (ar_sel == 2'b10);                     // 0x8000-0xBFFF
+  wire ar_is_len  = (ar_sel == 2'b11);                     // 0xC000-0xFFFF
+
+  logic       rd_active;
+  logic [1:0] r_sel;
+  wire  ar_fire    = s_axi_arvalid & s_axi_arready;
+  wire  rlast_fire = s_axi_rvalid  & s_axi_rready & s_axi_rlast;
 
   always_ff @(posedge aclk) begin
     if (~aresetn) begin
       rd_active <= 1'b0;
-      r_sel     <= 1'b0;
+      r_sel     <= 2'b00;
     end else if (ar_fire) begin
       rd_active <= 1'b1;
       r_sel     <= ar_sel;
@@ -136,26 +167,32 @@ module rifl_txrx_fifo #
   end
 
   // per-FIFO read-channel handshake signals
-  wire                      rxd_arready, tk_arready;
-  wire [AXI_DATA_WIDTH-1:0] rxd_rdata,   tk_rdata;
-  wire [1:0]                rxd_rresp,   tk_rresp;
-  wire                      rxd_rlast,   tk_rlast;
-  wire                      rxd_rvalid,  tk_rvalid;
+  wire                      rxd_arready, tk_arready, len_arready;
+  wire [AXI_DATA_WIDTH-1:0] rxd_rdata,   tk_rdata,   len_rdata;
+  wire [1:0]                rxd_rresp,   tk_rresp,   len_rresp;
+  wire                      rxd_rlast,   tk_rlast,   len_rlast;
+  wire                      rxd_rvalid,  tk_rvalid,  len_rvalid;
 
-  wire rxd_arvalid = s_axi_arvalid & ~rd_active & ~ar_sel;
-  wire tk_arvalid  = s_axi_arvalid & ~rd_active &  ar_sel;
-  assign s_axi_arready = ~rd_active & (ar_sel ? tk_arready : rxd_arready);
+  wire rxd_arvalid = s_axi_arvalid & ~rd_active & ar_is_data;
+  wire tk_arvalid  = s_axi_arvalid & ~rd_active & ar_is_tk;
+  wire len_arvalid = s_axi_arvalid & ~rd_active & ar_is_len;
+  assign s_axi_arready = ~rd_active &
+       (ar_is_data ? rxd_arready : ar_is_tk ? tk_arready : len_arready);
 
-  assign s_axi_rvalid = rd_active & (r_sel ? tk_rvalid : rxd_rvalid);
-  assign s_axi_rdata  = r_sel ? tk_rdata : rxd_rdata;
-  assign s_axi_rresp  = r_sel ? tk_rresp : rxd_rresp;
-  assign s_axi_rlast  = r_sel ? tk_rlast : rxd_rlast;
-  wire rxd_rready = rd_active & ~r_sel & s_axi_rready;
-  wire tk_rready  = rd_active &  r_sel & s_axi_rready;
+  wire rs_data = ~r_sel[1];
+  wire rs_tk   = (r_sel == 2'b10);
+  wire rs_len  = (r_sel == 2'b11);
+  assign s_axi_rvalid = rd_active & (rs_tk ? tk_rvalid : rs_len ? len_rvalid : rxd_rvalid);
+  assign s_axi_rdata  =             rs_tk ? tk_rdata   : rs_len ? len_rdata   : rxd_rdata;
+  assign s_axi_rresp  =             rs_tk ? tk_rresp   : rs_len ? len_rresp   : rxd_rresp;
+  assign s_axi_rlast  =             rs_tk ? tk_rlast   : rs_len ? len_rlast   : rxd_rlast;
+  wire rxd_rready = rd_active & rs_data & s_axi_rready;
+  wire tk_rready  = rd_active & rs_tk   & s_axi_rready;
+  wire len_rready = rd_active & rs_len  & s_axi_rready;
 
   // ---------------------------------------------------------------------------
-  // TX: shared AXI write channel -> FIFO -> register slice -> m_axis
-  // (read channel tied off)
+  // TX: shared AXI write channel -> data+descriptor FIFO -> register slice -> m_axis
+  // (read channel tied off).  awaddr[15] selects data write vs packet commit.
   // ---------------------------------------------------------------------------
   wire [AXI_DATA_WIDTH-1:0] tx_m_tdata;
   wire                      tx_m_tlast, tx_m_tvalid, tx_m_tready;
@@ -163,6 +200,8 @@ module rifl_txrx_fifo #
      .AXI_DATA_WIDTH(AXI_DATA_WIDTH)
     ,.AXI_ADDR_WIDTH(AXI_ADDR_WIDTH)
     ,.FIFO_DEPTH    (TX_FIFO_DEPTH)
+    ,.DESC_DEPTH    (TX_DESC_DEPTH)
+    ,.COMMIT_BIT    (DECODE_BIT)
   ) tx_fifo (
      .aclk(aclk), .aresetn(aresetn)
     ,.s_axi_awaddr(s_axi_awaddr), .s_axi_awlen(s_axi_awlen), .s_axi_awsize(s_axi_awsize)
@@ -179,6 +218,7 @@ module rifl_txrx_fifo #
     ,.axis_enable(tx_axis_enable)
     ,.m_axis_tdata(tx_m_tdata), .m_axis_tlast(tx_m_tlast)
     ,.m_axis_tvalid(tx_m_tvalid), .m_axis_tready(tx_m_tready)
+    ,.desc_count_o(tx_desc_count_o)
   );
 
   // TX register slice: break the long TX FIFO -> RIFL s_axis route.
@@ -238,6 +278,33 @@ module rifl_txrx_fifo #
     ,.s_axi_rdata(tk_rdata), .s_axi_rresp(tk_rresp), .s_axi_rlast(tk_rlast)
     ,.s_axi_rvalid(tk_rvalid), .s_axi_rready(tk_rready)
     ,.count_o(tkeep_count_o)
+  );
+
+  // ---------------------------------------------------------------------------
+  // RX length: one word per received packet (its beat-count) -> read demux
+  // (length side, +0xC000).  Pushed on the packet's TLAST beat; AXIS push unused
+  // otherwise.  Reuses axis_to_axi_full_fifo (length carried in the low bits).
+  // ---------------------------------------------------------------------------
+  axis_to_axi_full_fifo #(
+     .AXI_DATA_WIDTH(AXI_DATA_WIDTH)
+    ,.AXI_ADDR_WIDTH(AXI_ADDR_WIDTH)
+    ,.FIFO_DEPTH    (RX_PKT_DEPTH)
+  ) len_fifo (
+     .aclk(aclk), .aresetn(aresetn)
+    ,.s_axis_tdata(len_din), .s_axis_tlast(1'b0)
+    ,.s_axis_tvalid(len_push), .s_axis_tready(len_in_ready)
+    ,.s_axi_awaddr('0), .s_axi_awlen('0), .s_axi_awsize('0), .s_axi_awburst('0)
+    ,.s_axi_awlock('0), .s_axi_awcache('0), .s_axi_awprot('0), .s_axi_awqos('0)
+    ,.s_axi_awregion('0), .s_axi_awvalid(1'b0), .s_axi_awready()
+    ,.s_axi_wdata('0), .s_axi_wstrb('0), .s_axi_wlast(1'b0), .s_axi_wvalid(1'b0), .s_axi_wready()
+    ,.s_axi_bresp(), .s_axi_bvalid(), .s_axi_bready(1'b0)
+    ,.s_axi_araddr(s_axi_araddr), .s_axi_arlen(s_axi_arlen), .s_axi_arsize(s_axi_arsize)
+    ,.s_axi_arburst(s_axi_arburst), .s_axi_arlock(s_axi_arlock), .s_axi_arcache(s_axi_arcache)
+    ,.s_axi_arprot(s_axi_arprot), .s_axi_arqos(s_axi_arqos), .s_axi_arregion(s_axi_arregion)
+    ,.s_axi_arvalid(len_arvalid), .s_axi_arready(len_arready)
+    ,.s_axi_rdata(len_rdata), .s_axi_rresp(len_rresp), .s_axi_rlast(len_rlast)
+    ,.s_axi_rvalid(len_rvalid), .s_axi_rready(len_rready)
+    ,.count_o(rx_pkt_count_o)
   );
 
 endmodule

@@ -225,6 +225,9 @@ module rifl_subsystem
   localparam int RX_OCC_W         = $clog2(RX_FIFO_DEPTH_LP) + 1;
   wire [31:0] rx_occ_st    [num_gty_port_p];
   wire [31:0] tkeep_occ_st [num_gty_port_p];
+  localparam int DESC_OCC_W = $clog2(64) + 1;   // TX descriptor / RX length FIFO occupancy width
+  wire [31:0] tx_desc_st   [num_gty_port_p];     // TX packets buffered (per link)
+  wire [31:0] rx_pkt_st    [num_gty_port_p];     // RX packets received (per link)
 
   // RIFL/GTY wrappers.
   `define RIFL_MACRO(idx)                                                                           \
@@ -312,8 +315,10 @@ module rifl_subsystem
     // Combined per-link TX+RX FIFO on the clock-converter's m_axi (cc_*) port:
     //   WRITE -> TX FIFO -> RIFL s_axis;  RIFL m_axis -> RX data + tkeep FIFOs
     //   -> READ channel (araddr-decoded).
-    wire [RX_OCC_W-1:0] rx_occ_usr;
-    wire [RX_OCC_W-1:0] tkeep_occ_usr;
+    wire [RX_OCC_W-1:0]   rx_occ_usr;
+    wire [RX_OCC_W-1:0]   tkeep_occ_usr;
+    wire [DESC_OCC_W-1:0] tx_desc_usr;
+    wire [DESC_OCC_W-1:0] rx_pkt_usr;
     rifl_txrx_fifo #(
        .AXI_DATA_WIDTH(axis_data_width_p)
       ,.AXI_ADDR_WIDTH(32)
@@ -371,6 +376,8 @@ module rifl_subsystem
       ,.s_axis_tready (m_axis_tready_gty_i[i])
       ,.rx_count_o    (rx_occ_usr)
       ,.tkeep_count_o (tkeep_occ_usr)
+      ,.tx_desc_count_o(tx_desc_usr)
+      ,.rx_pkt_count_o (rx_pkt_usr)
     );
     // RIFL TX expects all bytes valid: TX tkeep forced high (whole 256-bit words).
     assign s_axis_tkeep_gty_i[i] = '1;
@@ -393,6 +400,25 @@ module rifl_subsystem
     );
     assign rx_occ_st[i]    = 32'(rx_occ_sync);
     assign tkeep_occ_st[i] = 32'(tkeep_occ_sync);
+
+    // TX descriptor (packets buffered) + RX length (packets received) occupancies -> init_clk.
+    wire [DESC_OCC_W-1:0] tx_desc_sync, rx_pkt_sync;
+    xpm_cdc_gray #(
+       .DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .REG_OUTPUT(1)
+      ,.SIM_ASSERT_CHK(0), .SIM_LOSSLESS_GRAY_CHK(0), .WIDTH(DESC_OCC_W)
+    ) tx_desc_cdc (
+       .dest_out_bin(tx_desc_sync), .dest_clk(init_clk)
+      ,.src_clk(rifl_usr_clks[i]), .src_in_bin(tx_desc_usr)
+    );
+    xpm_cdc_gray #(
+       .DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .REG_OUTPUT(1)
+      ,.SIM_ASSERT_CHK(0), .SIM_LOSSLESS_GRAY_CHK(0), .WIDTH(DESC_OCC_W)
+    ) rx_pkt_cdc (
+       .dest_out_bin(rx_pkt_sync), .dest_clk(init_clk)
+      ,.src_clk(rifl_usr_clks[i]), .src_in_bin(rx_pkt_usr)
+    );
+    assign tx_desc_st[i] = 32'(tx_desc_sync);
+    assign rx_pkt_st[i]  = 32'(rx_pkt_sync);
 
     // RIFL AXIS debug ILA -- synthesis/hardware only; define SIMULATION to drop it.
 `ifndef SIMULATION
@@ -532,8 +558,9 @@ module rifl_subsystem
   //   [14..93] per-channel event counters (rx_error, rx_pause, rx_retrans,
   //            tx_send_pause, tx_send_retrans; index = base + link*4 + channel)
   //   [94..97] compensate   [98..101] rx_data_occupancy   [102..105] rx_tkeep_occupancy
+  //   [106..109] tx_desc_occupancy (packets buffered)   [110..113] rx_pkt_count (packets received)
   localparam int EVT_PER_SIG    = num_gty_port_p*gt_serial_width_p;
-  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 3*num_gty_port_p; // 106
+  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 5*num_gty_port_p; // 114
 
   wire [CSR_NUM_STATUS-1:0][31:0] status_all;
   assign status_all[CSR_LVL_STATUS-1:0] = rifl_status_sync;
@@ -548,6 +575,8 @@ module rifl_subsystem
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + i]                    = evt_compensate_st[i];
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 1*num_gty_port_p + i] = rx_occ_st[i];
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 2*num_gty_port_p + i] = tkeep_occ_st[i];
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 3*num_gty_port_p + i] = tx_desc_st[i];  // 106+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 4*num_gty_port_p + i] = rx_pkt_st[i];   // 110+i
   end
 
   // ---------------------------------------------------------------------------
