@@ -92,12 +92,27 @@ module rifl_txrx_fifo #
 );
 
   // ---------------------------------------------------------------------------
+  // RX register slice: break the long RIFL m_axis -> RX FIFO route so the usr
+  // clock (~390 MHz) closes timing.  The skid carries {tlast, tkeep, tdata}.
+  // ---------------------------------------------------------------------------
+  wire [AXI_DATA_WIDTH-1:0] r_tdata;
+  wire [TKEEP_W-1:0]        r_tkeep;
+  wire                      r_tlast, r_tvalid, r_tready;
+  axis_skid_buffer #(.W(1 + TKEEP_W + AXI_DATA_WIDTH)) rx_skid (
+     .clk(aclk), .rstn(aresetn)
+    ,.s_data ({s_axis_tlast, s_axis_tkeep, s_axis_tdata})
+    ,.s_valid(s_axis_tvalid), .s_ready(s_axis_tready)
+    ,.m_data ({r_tlast, r_tkeep, r_tdata})
+    ,.m_valid(r_tvalid), .m_ready(r_tready)
+  );
+
+  // ---------------------------------------------------------------------------
   // RX beat fork: each accepted RIFL RX beat feeds both RX FIFOs (data + tkeep).
   // ---------------------------------------------------------------------------
   wire rxd_tready, tk_tready;
-  assign s_axis_tready = rxd_tready & tk_tready;
-  wire rxd_tvalid = s_axis_tvalid & tk_tready;   // present to data FIFO only if tkeep also ready
-  wire tk_tvalid  = s_axis_tvalid & rxd_tready;
+  assign r_tready = rxd_tready & tk_tready;
+  wire rxd_tvalid = r_tvalid & tk_tready;   // present to data FIFO only if tkeep also ready
+  wire tk_tvalid  = r_tvalid & rxd_tready;
 
   // ---------------------------------------------------------------------------
   // AXI read demux: route AR/R to the data or tkeep FIFO by araddr[DECODE_BIT].
@@ -139,8 +154,11 @@ module rifl_txrx_fifo #
   wire tk_rready  = rd_active &  r_sel & s_axi_rready;
 
   // ---------------------------------------------------------------------------
-  // TX: shared AXI write channel -> FIFO -> m_axis (read channel tied off)
+  // TX: shared AXI write channel -> FIFO -> register slice -> m_axis
+  // (read channel tied off)
   // ---------------------------------------------------------------------------
+  wire [AXI_DATA_WIDTH-1:0] tx_m_tdata;
+  wire                      tx_m_tlast, tx_m_tvalid, tx_m_tready;
   axi_full_to_axis_fifo #(
      .AXI_DATA_WIDTH(AXI_DATA_WIDTH)
     ,.AXI_ADDR_WIDTH(AXI_ADDR_WIDTH)
@@ -159,8 +177,17 @@ module rifl_txrx_fifo #
     ,.s_axi_arregion('0), .s_axi_arvalid(1'b0), .s_axi_arready()
     ,.s_axi_rdata(), .s_axi_rresp(), .s_axi_rlast(), .s_axi_rvalid(), .s_axi_rready(1'b0)
     ,.axis_enable(tx_axis_enable)
-    ,.m_axis_tdata(m_axis_tdata), .m_axis_tlast(m_axis_tlast)
-    ,.m_axis_tvalid(m_axis_tvalid), .m_axis_tready(m_axis_tready)
+    ,.m_axis_tdata(tx_m_tdata), .m_axis_tlast(tx_m_tlast)
+    ,.m_axis_tvalid(tx_m_tvalid), .m_axis_tready(tx_m_tready)
+  );
+
+  // TX register slice: break the long TX FIFO -> RIFL s_axis route.
+  axis_skid_buffer #(.W(1 + AXI_DATA_WIDTH)) tx_skid (
+     .clk(aclk), .rstn(aresetn)
+    ,.s_data ({tx_m_tlast, tx_m_tdata})
+    ,.s_valid(tx_m_tvalid), .s_ready(tx_m_tready)
+    ,.m_data ({m_axis_tlast, m_axis_tdata})
+    ,.m_valid(m_axis_tvalid), .m_ready(m_axis_tready)
   );
 
   // ---------------------------------------------------------------------------
@@ -172,7 +199,7 @@ module rifl_txrx_fifo #
     ,.FIFO_DEPTH    (RX_FIFO_DEPTH)
   ) rxd_fifo (
      .aclk(aclk), .aresetn(aresetn)
-    ,.s_axis_tdata(s_axis_tdata), .s_axis_tlast(s_axis_tlast)
+    ,.s_axis_tdata(r_tdata), .s_axis_tlast(r_tlast)
     ,.s_axis_tvalid(rxd_tvalid), .s_axis_tready(rxd_tready)
     ,.s_axi_awaddr('0), .s_axi_awlen('0), .s_axi_awsize('0), .s_axi_awburst('0)
     ,.s_axi_awlock('0), .s_axi_awcache('0), .s_axi_awprot('0), .s_axi_awqos('0)
@@ -197,7 +224,7 @@ module rifl_txrx_fifo #
     ,.FIFO_DEPTH    (TK_FIFO_DEPTH)
   ) tk_fifo (
      .aclk(aclk), .aresetn(aresetn)
-    ,.s_axis_tkeep(s_axis_tkeep), .s_axis_tlast(s_axis_tlast)
+    ,.s_axis_tkeep(r_tkeep), .s_axis_tlast(r_tlast)
     ,.s_axis_tvalid(tk_tvalid), .s_axis_tready(tk_tready)
     ,.s_axi_awaddr('0), .s_axi_awlen('0), .s_axi_awsize('0), .s_axi_awburst('0)
     ,.s_axi_awlock('0), .s_axi_awcache('0), .s_axi_awprot('0), .s_axi_awqos('0)
@@ -213,6 +240,56 @@ module rifl_txrx_fifo #
     ,.count_o(tkeep_count_o)
   );
 
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// axis_skid_buffer: 2-deep AXI-Stream register slice (pipeline register + skid).
+// Registers the forward data/valid path so it can be placed midway on a long
+// route; full throughput in steady state.  Payload is opaque (W bits).
+// -----------------------------------------------------------------------------
+module axis_skid_buffer #(parameter integer W = 257)
+(
+    input  wire         clk
+  , input  wire         rstn
+  , input  wire [W-1:0] s_data
+  , input  wire         s_valid
+  , output wire         s_ready
+  , output wire [W-1:0] m_data
+  , output wire         m_valid
+  , input  wire         m_ready
+);
+  reg          full;        // skid register occupied
+  reg [W-1:0]  skid_data;
+  reg          out_valid;
+  reg [W-1:0]  out_data;
+
+  assign s_ready = ~full;
+  assign m_valid = out_valid;
+  assign m_data  = out_data;
+
+  wire s_fire = s_valid & ~full;
+
+  always @(posedge clk) begin
+    if (~rstn) begin
+      full      <= 1'b0;
+      out_valid <= 1'b0;
+    end else if (~out_valid | m_ready) begin
+      // output register free to (re)load: drain skid if present, else take input
+      if (full) begin
+        out_data  <= skid_data;
+        out_valid <= 1'b1;
+        full      <= 1'b0;
+      end else begin
+        out_data  <= s_data;
+        out_valid <= s_fire;
+      end
+    end else if (s_fire) begin
+      // output stalled (out_valid & ~m_ready): capture one word into the skid
+      skid_data <= s_data;
+      full      <= 1'b1;
+    end
+  end
 endmodule
 
 `default_nettype wire

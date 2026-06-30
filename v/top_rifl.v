@@ -38,10 +38,6 @@ module top_rifl
   , input  wire [num_gty_port_p*gt_serial_width_p-1:0] rifl_gt_o_gt_rxp_in
   , output wire [num_gty_port_p*gt_serial_width_p-1:0] rifl_gt_o_gt_txn_out
   , output wire [num_gty_port_p*gt_serial_width_p-1:0] rifl_gt_o_gt_txp_out
-
-  // Per-link recovered user clock + reset (debug visibility).
-  , output wire [num_gty_port_p-1:0] rifl_usr_clk_o
-  , output wire [num_gty_port_p-1:0] rifl_usr_rst_o
 );
 
   // ---- shared clocks / resets (init_clk + converter/usr resets from rifl_subsystem;
@@ -51,8 +47,6 @@ module top_rifl
   wire                      cc_s_aresetn;
   wire [num_gty_port_p-1:0] usr_clks;
   wire [num_gty_port_p-1:0] cc_m_aresetn;
-
-  assign rifl_usr_clk_o = usr_clks;
 
   // ---- domain-1 reset: JTAG-driven VIO -> design_1 (and the register map) ----
   // Runs in init_clk (sourced by rifl_subsystem's firmware_bd); active-high VIO rst
@@ -190,7 +184,7 @@ module top_rifl
     ,.rifl_gt_o_gt_rxn_in(rifl_gt_o_gt_rxn_in), .rifl_gt_o_gt_rxp_in(rifl_gt_o_gt_rxp_in)
     ,.rifl_gt_o_gt_txn_out(rifl_gt_o_gt_txn_out), .rifl_gt_o_gt_txp_out(rifl_gt_o_gt_txp_out)
     ,.init_clk_o(init_clk), .axi_aresetn_i(axi_aresetn_li), .cc_s_aresetn_o(cc_s_aresetn)
-    ,.usr_clk_o(usr_clks), .usr_rst_o(rifl_usr_rst_o), .cc_m_aresetn_o(cc_m_aresetn)
+    ,.usr_clk_o(usr_clks), .usr_rst_o(), .cc_m_aresetn_o(cc_m_aresetn)
     // cc_* <- clock converters m_axi
     ,.cc_awaddr(c_awaddr), .cc_awlen(c_awlen), .cc_awsize(c_awsize)
     ,.cc_awburst(c_awburst), .cc_awlock(c_awlock), .cc_awcache(c_awcache)

@@ -43,9 +43,9 @@ Requires Vivado **2019.1.3** (AR72746); part `xcvu47p-fsvh2892-3-e`.
 
 ```sh
 export XILINX_VIVADO=/path/to/Xilinx/Vivado/2019.1
-make create_rifl_project      # create the vu47p_rifl project (top_rifl)
-make open_rifl_project        # open in the GUI
-make generate_bitstream       # synth -> impl -> bitstream
+make build_rifl               # create (if needed) + synth + impl + bitstream
+make create_rifl_project      # create the project only (no synth/impl)
+make open_rifl_project        # open the project in the GUI
 make program_fpga XVC_URL=<host:port>
 ```
 
@@ -58,3 +58,8 @@ make program_fpga XVC_URL=<host:port>
 - Behavioral simulation compiles against the RIFL **RTL source** (not a netlist).
   Full GTY `secureip` elaboration is impractical under xsim 2019.1.3; for
   datapath/AXI verification use a GT-bypass loopback in place of the transceiver.
+- `make build_rifl` implements with `Performance_ExplorePostRoutePhysOpt`. The
+  ~390 MHz GTY user-clock datapath closes timing via AXIS register slices
+  (`axis_skid_buffer` in `v/rifl_txrx_fifo.v`) on the FIFO↔RIFL TX/RX paths,
+  which decouple FIFO placement from the GT. `xdc/impl.tcl` carries the GT refclk
+  pin placement, the init/core/usr-clock CDC constraints, and the per-link pblocks.

@@ -7,10 +7,8 @@ set_property PACKAGE_PIN BN46 [get_ports {led[1]}]
 #set_property PACKAGE_PIN BP43 [get_ports {led[3]}]
 set_property IOSTANDARD LVCMOS18 [get_ports {led[*]}]
 
-# Reset
-set_property PACKAGE_PIN BG43 [get_ports {rstn}]
-set_property IOSTANDARD LVCMOS18 [get_ports {rstn}]
-set_property PULLTYPE PULLUP [get_ports {rstn}]
+# Reset: the rstn pin was removed -- all resets are software/JTAG-controlled
+# (top-level design_vio_rifl_rst VIO + register-map control bits).
 
 
 

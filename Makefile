@@ -1,9 +1,9 @@
 # =============================================================================
 # Self-contained VU47P RIFL bring-up image (top_rifl).
 #
-#   make create_rifl_project        create the vu47p_rifl Vivado project
+#   make create_rifl_project        create the vu47p_rifl Vivado project (no build)
+#   make build_rifl                 create (if needed) + synth + impl + bitstream
 #   make open_rifl_project          open it in the Vivado GUI
-#   make generate_bitstream         run synth -> impl -> bitstream
 #   make program_fpga XVC_URL=...   program the FPGA over XVC
 #   make clean_rifl_project         remove the generated project
 #   make clean_xci                  remove generated IP output products (keep .xci)
@@ -20,7 +20,7 @@ rifl_project_dir := $(THIS_DIR)/vu47p_rifl
 rifl_project_xpr := $(rifl_project_dir)/vu47p_rifl.xpr
 rifl_project_tcl := $(THIS_DIR)/vu47p_rifl_project.tcl
 
-.PHONY: all create_rifl_project open_rifl_project generate_bitstream \
+.PHONY: all create_rifl_project build_rifl open_rifl_project \
         program_fpga update_tcl clean_rifl_project clean_xci are_you_sure
 
 all: create_rifl_project
@@ -32,8 +32,8 @@ $(rifl_project_dir): $(rifl_project_tcl)
 open_rifl_project:
 	$(vivado_bin) $(rifl_project_xpr) &
 
-generate_bitstream:
-	$(vivado_bin) -mode batch -source $(script_dir)/generate_bitstream.tcl
+build_rifl:
+	$(vivado_bin) -mode batch -source $(script_dir)/build_rifl.tcl
 
 program_fpga:
 	$(vivado_bin) -mode batch -source $(script_dir)/program_fpga.tcl -tclargs $(XVC_URL)
