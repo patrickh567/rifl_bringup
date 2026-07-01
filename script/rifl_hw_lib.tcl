@@ -263,12 +263,13 @@ proc rifl_link_is_up  {link} { return [expr {[rifl_link_nibble $link] == 0xF}] }
 proc rifl_rx_occ      {link} { return [rifl_rd [expr {$::RIFL_ST_RXOCC_BASE + 4*$link}]] }
 proc rifl_tkeep_occ   {link} { return [rifl_rd [expr {$::RIFL_ST_TKOCC_BASE + 4*$link}]] }
 
-# read out and discard any residual RX data / tkeep / length so a test starts clean
+# read out and discard any residual RX data / tkeep / length so a test starts clean.
+# Reads are chunked to <= 32 words (256 beats), the AXI4 max burst.
 proc rifl_drain_all {} {
   for {set r 0} {$r < 4} {incr r} {
-    set o [rifl_rx_occ $r];     if {$o > 0} { rifl_rx_burst $r $o 0 }
-    set k [rifl_tkeep_occ $r];  if {$k > 0} { rifl_rx_burst $r $k 1 }
-    set p [rifl_rx_pkt_occ $r]; if {$p > 0} { rifl_rx_len   $r $p }
+    set g 0; while {[set o [rifl_rx_occ $r]]     > 0 && $g < 128} { rifl_rx_burst $r [expr {$o>32?32:$o}] 0; incr g }
+    set g 0; while {[set k [rifl_tkeep_occ $r]]  > 0 && $g < 128} { rifl_rx_burst $r [expr {$k>32?32:$k}] 1; incr g }
+    set g 0; while {[set p [rifl_rx_pkt_occ $r]] > 0 && $g < 128} { rifl_rx_len   $r [expr {$p>32?32:$p}];   incr g }
   }
 }
 
