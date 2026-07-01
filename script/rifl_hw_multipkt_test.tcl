@@ -40,13 +40,15 @@ rifl_ctrl_set $::RIFL_CORE_RESET; after 200; rifl_ctrl_clr $::RIFL_CORE_RESET
 if {![rifl_wait_links_up 10000]} { puts ">>> WARNING: not all links up" }
 rifl_status
 
-set sizes {3 1 5 2}                 ;# packet sizes (256-bit beats), in order
+# a larger batch of varying-size packets (256-bit beats) to exercise the deeper FIFOs
+set sizes {}
+for {set i 0} {$i < 32} {incr i} { lappend sizes [expr {($i % 8) + 1}] }
 set npkt  [llength $sizes]
 set total 0
 set pass  0
 
 for {set L 0} {$L < 4} {incr L} {
-  puts "===== TX link $L: load $npkt packets, sizes {$sizes} (beats) ====="
+  puts [format "===== TX link %d: load %d packets, %d beats total =====" $L $npkt [expr [join $sizes +]]]
   rifl_ctrl_clr $::RIFL_AXIS_EN
   rifl_drain_all
 
@@ -81,6 +83,7 @@ for {set L 0} {$L < 4} {incr L} {
   puts [format "  TX %d -> RX %d : %d packet(s) received" $L $arr [rifl_rx_pkt_occ $arr]]
 
   # ---- read back packet-by-packet, verify boundary + data ----
+  set lpass 0
   for {set p 0} {$p < $npkt} {incr p} {
     incr total
     if {[rifl_rx_pkt_occ $arr] < 1} { puts [format "  pkt %d: MISSING (no length in RX)" $p]; continue }
@@ -93,13 +96,13 @@ for {set L 0} {$L < 4} {incr L} {
     set rd  [rifl_rx_burst $arr $toread 0]
     set exp [lindex $sent $p]
     if {$Lrx == $Lexp && $toread == $Lrx && [string equal -nocase $rd $exp]} {
-      puts [format "  pkt %d: PASS  (len=%-2d beats / %4d bytes, boundary+data OK)" $p $Lrx [expr {$Lrx*32}]]
-      incr pass
+      incr lpass; incr pass
     } else {
       puts [format "  pkt %d: FAIL  (rx_len=%d exp=%d, read=%d, data=%s)" \
               $p $Lrx $Lexp $toread [expr {[string equal -nocase $rd $exp] ? "match" : "MISMATCH"}]]
     }
   }
+  puts [format "  verified %d/%d packets (boundary + data)" $lpass $npkt]
   rifl_ctrl_clr $::RIFL_AXIS_EN
 }
 

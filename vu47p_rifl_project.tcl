@@ -57,13 +57,14 @@ add_files -norecurse -fileset [get_filesets sources_1] [list \
   [file normalize "${origin_dir}/v/event_capture_cdc.v"] \
   [file normalize "${origin_dir}/v/axi_jtag_master.v"] \
   [file normalize "${origin_dir}/v/rifl_axi_clock_converters.v"] \
+  [file normalize "${origin_dir}/v/rifl_prbs_bist.sv"] \
   [file normalize "${origin_dir}/v/rifl_subsystem.v"] \
   [file normalize "${origin_dir}/v/top_rifl.v"] ]
 set_property -name "file_type" -value "SystemVerilog" -objects \
   [get_files -of_objects [get_filesets sources_1] [list \
      "*v/axi_full_to_axis_fifo.v" "*v/axis_to_axi_full_fifo.v" "*v/tkeep_pack_fifo.v" "*v/rifl_txrx_fifo.v" \
      "*v/axi_lite_regs.v" "*v/event_capture_cdc.v" "*v/axi_jtag_master.v" \
-     "*v/rifl_axi_clock_converters.v" "*v/rifl_subsystem.v" "*v/top_rifl.v"]]
+     "*v/rifl_axi_clock_converters.v" "*v/rifl_prbs_bist.sv" "*v/rifl_subsystem.v" "*v/top_rifl.v"]]
 
 set_property top top_rifl [get_filesets sources_1]
 set_property top top_rifl [get_filesets sim_1]

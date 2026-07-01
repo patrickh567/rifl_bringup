@@ -48,6 +48,14 @@ set ::RIFL_ST_RXOCC_BASE  0x1C8
 set ::RIFL_ST_TKOCC_BASE  0x1D8
 set ::RIFL_ST_TXDESC_BASE 0x1E8
 set ::RIFL_ST_RXPKT_BASE  0x1F8
+set ::RIFL_ST_PRBS_ERR_BASE 0x208    ;# per-link PRBS corrupted-packet count
+set ::RIFL_ST_PRBS_OCC_BASE 0x218    ;# per-link PRBS error-record FIFO occupancy (256b words)
+
+# PRBS BIST control registers
+set ::RIFL_CTRL1          0x04       ;# [3:0] per-link enable, [8] clear, [19:16] per-link seed-perturb
+set ::RIFL_PRBS_MAXLEN    0x08       ;# [15:0] max packet length (beats)
+set ::RIFL_PRBS_SEED      0x0C       ;# [31:0] PRBS + length seed
+set ::RIFL_PRBS_LENMODE   0x10       ;# [1:0] mode (0 fixed/1 sweep/2,3 random), [17:2] min length (beats)
 
 # ctrl reg0 bit masks
 set ::RIFL_AXIS_EN        0x1
@@ -207,6 +215,42 @@ proc rifl_rx_pop_len {link} {
 }
 proc rifl_tx_desc_occ {link} { return [rifl_rd [expr {$::RIFL_ST_TXDESC_BASE + 4*$link}]] }
 proc rifl_rx_pkt_occ  {link} { return [rifl_rd [expr {$::RIFL_ST_RXPKT_BASE  + 4*$link}]] }
+
+# ---- PRBS BIST (built-in self-test generator/checker) ----
+proc rifl_prbs_err_cnt {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_ERR_BASE + 4*$link}]] }
+proc rifl_prbs_occ     {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_OCC_BASE + 4*$link}]] }
+# Configure the generators/checkers (write BEFORE enabling): seed, max length,
+# length mode (2/3 = random), min length.  Same seed on all links so each link's
+# checker matches its peer's generator.
+proc rifl_prbs_config {seed maxlen {mode 2} {minlen 1}} {
+  rifl_reg_wr $::RIFL_PRBS_SEED    $seed
+  rifl_reg_wr $::RIFL_PRBS_MAXLEN  [expr {$maxlen & 0xFFFF}]
+  rifl_reg_wr $::RIFL_PRBS_LENMODE [expr {($mode & 0x3) | (($minlen & 0xFFFF) << 2)}]
+}
+# Enable a per-link mask (bit L).  Optional perturb mask (bit L) makes link L's
+# checker expect a different sequence than its peer sends -> guaranteed errors.
+# The perturb is written first (enable low), then the enable rises, so the
+# quasi-static config is stable before the per-link start edge (also forces a
+# clean rising edge each call = a fresh run with zeroed counters).
+proc rifl_prbs_enable {enmask {perturb 0}} {
+  set pbits [expr {($perturb & 0xF) << 16}]
+  rifl_reg_wr $::RIFL_CTRL1 $pbits
+  after 20
+  rifl_reg_wr $::RIFL_CTRL1 [expr {($enmask & 0xF) | $pbits}]
+}
+# Read ONE error record (3 x 256-bit beats = 24 JTAG beats) from link L at +0x4000.
+# Returns the raw 192-hex string.  Two of the three words are the expected vs
+# received 256-bit data; the third packs pkt/flit index, exp/rcv tkeep, and the
+# mismatch-kind flags.  (Confirm the word/field order once on hardware.)
+proc rifl_prbs_err_rec {link} {
+  set addr [format 0x%08X [expr {[rifl_link_base $link] + 0x4000}]]
+  catch { delete_hw_axi_txn [get_hw_axi_txns -quiet rifl_er] }
+  create_hw_axi_txn rifl_er $::rifl_axi -address $addr -len 24 -type read
+  run_hw_axi -quiet [get_hw_axi_txns rifl_er]
+  set d [get_property DATA [get_hw_axi_txns rifl_er]]
+  delete_hw_axi_txn [get_hw_axi_txns rifl_er]
+  return $d
+}
 
 # ---- link status helpers ----
 proc rifl_link_nibble {link} { return [expr {([rifl_rd $::RIFL_ST_RX_UP] >> ($link*4)) & 0xF}] }

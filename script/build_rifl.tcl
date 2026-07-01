@@ -21,6 +21,13 @@ if {[file exists $proj_xpr]} {
 } else {
   source vu47p_rifl_project.tcl
 }
+# Ensure the PRBS BIST module is present.  It was added to vu47p_rifl_project.tcl
+# after the .xpr was first created, so an already-existing project won't have it.
+if {[llength [get_files -quiet *rifl_prbs_bist.sv]] == 0} {
+  add_files -norecurse -fileset [get_filesets sources_1] [file normalize "v/rifl_prbs_bist.sv"]
+  set_property file_type SystemVerilog [get_files -quiet *rifl_prbs_bist.sv]
+  puts "INFO: added v/rifl_prbs_bist.sv to the existing project."
+}
 update_compile_order -fileset sources_1
 
 # ---- synthesis ----

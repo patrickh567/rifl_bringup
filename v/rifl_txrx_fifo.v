@@ -32,13 +32,15 @@ module rifl_txrx_fifo #
   , parameter integer TK_FIFO_DEPTH  = 512
   , parameter integer TX_DESC_DEPTH  = 64        // TX descriptor FIFO (max buffered TX packets)
   , parameter integer RX_PKT_DEPTH   = 64        // RX length FIFO (max buffered RX packet lengths)
-  , parameter integer DECODE_BIT     = 15        // read sel = araddr[15:14]: 0x=data,10=tkeep,11=len
+  , parameter integer ERR_FIFO_DEPTH = 192       // PRBS error-record FIFO (3 x 256b beats per record)
+  , parameter integer DECODE_BIT     = 15        // read sel = araddr[15:14]: 00=data,01=err,10=tkeep,11=len
   , localparam integer STRB_WIDTH    = AXI_DATA_WIDTH/8
   , localparam integer TKEEP_W       = AXI_DATA_WIDTH/8
   , localparam integer RX_CNT_WIDTH  = $clog2(RX_FIFO_DEPTH) + 1
   , localparam integer TK_CNT_WIDTH  = $clog2(TK_FIFO_DEPTH) + 1
   , localparam integer TX_DESC_CNT_W = $clog2(TX_DESC_DEPTH) + 1
   , localparam integer RX_PKT_CNT_W  = $clog2(RX_PKT_DEPTH) + 1
+  , localparam integer ERR_CNT_WIDTH = $clog2(ERR_FIFO_DEPTH) + 1
 )
 (
     input  wire                       aclk
@@ -100,6 +102,12 @@ module rifl_txrx_fifo #
   , output wire [TK_CNT_WIDTH-1:0]    tkeep_count_o    // RX tkeep FIFO (packed words)
   , output wire [TX_DESC_CNT_W-1:0]   tx_desc_count_o  // TX descriptor FIFO (packets buffered)
   , output wire [RX_PKT_CNT_W-1:0]    rx_pkt_count_o   // RX length FIFO (packets received)
+
+  // ---- PRBS error-record FIFO: AXIS push from the BIST, read at +0x4000 ----
+  , input  wire [AXI_DATA_WIDTH-1:0]  err_s_axis_tdata
+  , input  wire                       err_s_axis_tvalid
+  , output wire                       err_s_axis_tready
+  , output wire [ERR_CNT_WIDTH-1:0]   err_count_o      // error FIFO occupancy (256b words)
 );
 
   // ---------------------------------------------------------------------------
@@ -145,7 +153,8 @@ module rifl_txrx_fifo #
   // Serialized: accept a new AR only when no read burst is in flight.
   // ---------------------------------------------------------------------------
   wire [1:0] ar_sel  = s_axi_araddr[DECODE_BIT -: 2];      // [15:14]
-  wire ar_is_data = ~ar_sel[1];                            // 0x0000-0x7FFF
+  wire ar_is_data = (ar_sel == 2'b00);                     // 0x0000-0x3FFF
+  wire ar_is_err  = (ar_sel == 2'b01);                     // 0x4000-0x7FFF  PRBS error records
   wire ar_is_tk   = (ar_sel == 2'b10);                     // 0x8000-0xBFFF
   wire ar_is_len  = (ar_sel == 2'b11);                     // 0xC000-0xFFFF
 
@@ -167,26 +176,29 @@ module rifl_txrx_fifo #
   end
 
   // per-FIFO read-channel handshake signals
-  wire                      rxd_arready, tk_arready, len_arready;
-  wire [AXI_DATA_WIDTH-1:0] rxd_rdata,   tk_rdata,   len_rdata;
-  wire [1:0]                rxd_rresp,   tk_rresp,   len_rresp;
-  wire                      rxd_rlast,   tk_rlast,   len_rlast;
-  wire                      rxd_rvalid,  tk_rvalid,  len_rvalid;
+  wire                      rxd_arready, tk_arready, len_arready, err_arready;
+  wire [AXI_DATA_WIDTH-1:0] rxd_rdata,   tk_rdata,   len_rdata,   err_rdata;
+  wire [1:0]                rxd_rresp,   tk_rresp,   len_rresp,   err_rresp;
+  wire                      rxd_rlast,   tk_rlast,   len_rlast,   err_rlast;
+  wire                      rxd_rvalid,  tk_rvalid,  len_rvalid,  err_rvalid;
 
   wire rxd_arvalid = s_axi_arvalid & ~rd_active & ar_is_data;
+  wire err_arvalid = s_axi_arvalid & ~rd_active & ar_is_err;
   wire tk_arvalid  = s_axi_arvalid & ~rd_active & ar_is_tk;
   wire len_arvalid = s_axi_arvalid & ~rd_active & ar_is_len;
   assign s_axi_arready = ~rd_active &
-       (ar_is_data ? rxd_arready : ar_is_tk ? tk_arready : len_arready);
+       (ar_is_data ? rxd_arready : ar_is_err ? err_arready : ar_is_tk ? tk_arready : len_arready);
 
-  wire rs_data = ~r_sel[1];
+  wire rs_data = (r_sel == 2'b00);
+  wire rs_err  = (r_sel == 2'b01);
   wire rs_tk   = (r_sel == 2'b10);
   wire rs_len  = (r_sel == 2'b11);
-  assign s_axi_rvalid = rd_active & (rs_tk ? tk_rvalid : rs_len ? len_rvalid : rxd_rvalid);
-  assign s_axi_rdata  =             rs_tk ? tk_rdata   : rs_len ? len_rdata   : rxd_rdata;
-  assign s_axi_rresp  =             rs_tk ? tk_rresp   : rs_len ? len_rresp   : rxd_rresp;
-  assign s_axi_rlast  =             rs_tk ? tk_rlast   : rs_len ? len_rlast   : rxd_rlast;
+  assign s_axi_rvalid = rd_active & (rs_err ? err_rvalid : rs_tk ? tk_rvalid : rs_len ? len_rvalid : rxd_rvalid);
+  assign s_axi_rdata  =             rs_err ? err_rdata   : rs_tk ? tk_rdata   : rs_len ? len_rdata   : rxd_rdata;
+  assign s_axi_rresp  =             rs_err ? err_rresp   : rs_tk ? tk_rresp   : rs_len ? len_rresp   : rxd_rresp;
+  assign s_axi_rlast  =             rs_err ? err_rlast   : rs_tk ? tk_rlast   : rs_len ? len_rlast   : rxd_rlast;
   wire rxd_rready = rd_active & rs_data & s_axi_rready;
+  wire err_rready = rd_active & rs_err  & s_axi_rready;
   wire tk_rready  = rd_active & rs_tk   & s_axi_rready;
   wire len_rready = rd_active & rs_len  & s_axi_rready;
 
@@ -305,6 +317,33 @@ module rifl_txrx_fifo #
     ,.s_axi_rdata(len_rdata), .s_axi_rresp(len_rresp), .s_axi_rlast(len_rlast)
     ,.s_axi_rvalid(len_rvalid), .s_axi_rready(len_rready)
     ,.count_o(rx_pkt_count_o)
+  );
+
+  // ---------------------------------------------------------------------------
+  // PRBS error records: the BIST pushes each corrupted-packet record as 3 x
+  // 256-bit beats -> this FIFO -> read demux (error side, +0x4000).  Reuses
+  // axis_to_axi_full_fifo; software reads (occupancy/3) records of 3 beats each.
+  // ---------------------------------------------------------------------------
+  axis_to_axi_full_fifo #(
+     .AXI_DATA_WIDTH(AXI_DATA_WIDTH)
+    ,.AXI_ADDR_WIDTH(AXI_ADDR_WIDTH)
+    ,.FIFO_DEPTH    (ERR_FIFO_DEPTH)
+  ) err_fifo (
+     .aclk(aclk), .aresetn(aresetn)
+    ,.s_axis_tdata(err_s_axis_tdata), .s_axis_tlast(1'b0)
+    ,.s_axis_tvalid(err_s_axis_tvalid), .s_axis_tready(err_s_axis_tready)
+    ,.s_axi_awaddr('0), .s_axi_awlen('0), .s_axi_awsize('0), .s_axi_awburst('0)
+    ,.s_axi_awlock('0), .s_axi_awcache('0), .s_axi_awprot('0), .s_axi_awqos('0)
+    ,.s_axi_awregion('0), .s_axi_awvalid(1'b0), .s_axi_awready()
+    ,.s_axi_wdata('0), .s_axi_wstrb('0), .s_axi_wlast(1'b0), .s_axi_wvalid(1'b0), .s_axi_wready()
+    ,.s_axi_bresp(), .s_axi_bvalid(), .s_axi_bready(1'b0)
+    ,.s_axi_araddr(s_axi_araddr), .s_axi_arlen(s_axi_arlen), .s_axi_arsize(s_axi_arsize)
+    ,.s_axi_arburst(s_axi_arburst), .s_axi_arlock(s_axi_arlock), .s_axi_arcache(s_axi_arcache)
+    ,.s_axi_arprot(s_axi_arprot), .s_axi_arqos(s_axi_arqos), .s_axi_arregion(s_axi_arregion)
+    ,.s_axi_arvalid(err_arvalid), .s_axi_arready(err_arready)
+    ,.s_axi_rdata(err_rdata), .s_axi_rresp(err_rresp), .s_axi_rlast(err_rlast)
+    ,.s_axi_rvalid(err_rvalid), .s_axi_rready(err_rready)
+    ,.count_o(err_count_o)
   );
 
 endmodule

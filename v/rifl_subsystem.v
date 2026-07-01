@@ -151,6 +151,19 @@ module rifl_subsystem
   // of the clock converters (cc_reset).
   wire core_reset = csr[0][2];
 
+  // ---- PRBS BIST controls (init_clk; CDC'd per-link into rifl_usr_clk) ----
+  // reg 1: [3:0] per-link PRBS enable, [8] clear (counts+error FIFO), [19:16] per-link
+  //        seed-perturb (forces that link's checker to mismatch).
+  // reg 2: [15:0] max packet length (beats).  reg 3: [31:0] PRBS + length seed.
+  // reg 4: [1:0] length mode (0 fixed/1 sweep/2,3 random), [17:2] min length (beats).
+  wire [num_gty_port_p-1:0] prbs_enable_all   = csr[1][num_gty_port_p-1:0];
+  wire                      prbs_clear        = csr[1][8];
+  wire [num_gty_port_p-1:0] prbs_seed_perturb = csr[1][16 +: num_gty_port_p];
+  wire [15:0]               prbs_max_len      = csr[2][15:0];
+  wire [31:0]               prbs_seed         = csr[3];
+  wire [1:0]                prbs_len_mode     = csr[4][1:0];
+  wire [15:0]               prbs_min_len      = csr[4][17:2];
+
   wire [num_gty_port_p-1:0] rifl_rsts;
   wire [num_gty_port_p-1:0] rifl_gt_rsts;
   wire [num_gty_port_p-1:0] rifl_usr_rsts;
@@ -220,14 +233,22 @@ module rifl_subsystem
   wire [31:0] evt_tx_sretr_st   [num_gty_port_p][gt_serial_width_p];
   wire [31:0] evt_compensate_st [num_gty_port_p];
 
-  // ---- RX FIFO occupancy status (init_clk) ----
-  localparam int RX_FIFO_DEPTH_LP = 512;
-  localparam int RX_OCC_W         = $clog2(RX_FIFO_DEPTH_LP) + 1;
+  // ---- FIFO depths + occupancy status (init_clk).  Raise these to queue more /
+  //      larger packets: the data FIFOs hold beats; the descriptor (TX) / length
+  //      (RX) FIFOs bound the number of buffered packets. ----
+  localparam int RX_FIFO_DEPTH_LP  = 512;        // per-link data FIFO depth (beats; 1024 misses ~390MHz timing, WNS -0.34)
+  localparam int PKT_FIFO_DEPTH_LP = 256;        // max buffered packets (TX descriptors / RX lengths)
+  localparam int RX_OCC_W   = $clog2(RX_FIFO_DEPTH_LP)  + 1;
+  localparam int DESC_OCC_W = $clog2(PKT_FIFO_DEPTH_LP) + 1;
   wire [31:0] rx_occ_st    [num_gty_port_p];
   wire [31:0] tkeep_occ_st [num_gty_port_p];
-  localparam int DESC_OCC_W = $clog2(64) + 1;   // TX descriptor / RX length FIFO occupancy width
   wire [31:0] tx_desc_st   [num_gty_port_p];     // TX packets buffered (per link)
   wire [31:0] rx_pkt_st    [num_gty_port_p];     // RX packets received (per link)
+  // PRBS BIST status (per link): corrupted-packet count + error-record FIFO fill.
+  localparam int ERR_FIFO_DEPTH_LP = 192;        // error-record FIFO (3 x 256b beats per record)
+  localparam int ERR_OCC_W = $clog2(ERR_FIFO_DEPTH_LP) + 1;
+  wire [31:0] prbs_err_st  [num_gty_port_p];     // corrupted packets (per link)
+  wire [31:0] prbs_occ_st  [num_gty_port_p];     // error-record FIFO occupancy (per link)
 
   // RIFL/GTY wrappers.
   `define RIFL_MACRO(idx)                                                                           \
@@ -322,8 +343,11 @@ module rifl_subsystem
     rifl_txrx_fifo #(
        .AXI_DATA_WIDTH(axis_data_width_p)
       ,.AXI_ADDR_WIDTH(32)
+      ,.TX_FIFO_DEPTH (RX_FIFO_DEPTH_LP)
       ,.RX_FIFO_DEPTH (RX_FIFO_DEPTH_LP)
       ,.TK_FIFO_DEPTH (RX_FIFO_DEPTH_LP)
+      ,.TX_DESC_DEPTH (PKT_FIFO_DEPTH_LP)
+      ,.RX_PKT_DEPTH  (PKT_FIFO_DEPTH_LP)
     ) txrx_fifo (
        .aclk          (rifl_usr_clks[i])
       ,.aresetn       (usr_aresetn)
@@ -362,25 +386,84 @@ module rifl_subsystem
       ,.s_axi_rlast   (cc_rlast[i]  )
       ,.s_axi_rvalid  (cc_rvalid[i] )
       ,.s_axi_rready  (cc_rready[i] )
-      // TX: drained stream -> RIFL link s_axis
+      // TX: drained stream -> mux (vs PRBS generator) -> RIFL link s_axis
       ,.tx_axis_enable(axis_enable_sync)
-      ,.m_axis_tdata  (s_axis_tdata_gty_i[i] )
-      ,.m_axis_tlast  (s_axis_tlast_gty_i[i] )
-      ,.m_axis_tvalid (s_axis_tvalid_gty_i[i])
-      ,.m_axis_tready (s_axis_tready_gty_o[i])
-      // RX: RIFL m_axis -> RX data + packed-tkeep FIFOs
+      ,.m_axis_tdata  (fifo_tx_tdata )
+      ,.m_axis_tlast  (fifo_tx_tlast )
+      ,.m_axis_tvalid (fifo_tx_tvalid)
+      ,.m_axis_tready (fifo_tx_tready)
+      // RX: RIFL m_axis -> RX data + packed-tkeep FIFOs (valid gated off in PRBS mode)
       ,.s_axis_tdata  (m_axis_tdata_gty_o[i] )
       ,.s_axis_tkeep  (m_axis_tkeep_gty_o[i] )
       ,.s_axis_tlast  (m_axis_tlast_gty_o[i] )
-      ,.s_axis_tvalid (m_axis_tvalid_gty_o[i])
-      ,.s_axis_tready (m_axis_tready_gty_i[i])
+      ,.s_axis_tvalid (fifo_rx_tvalid        )
+      ,.s_axis_tready (fifo_rx_tready        )
       ,.rx_count_o    (rx_occ_usr)
       ,.tkeep_count_o (tkeep_occ_usr)
       ,.tx_desc_count_o(tx_desc_usr)
       ,.rx_pkt_count_o (rx_pkt_usr)
+      // PRBS error-record FIFO: pushed by the BIST checker, read at +0x4000
+      ,.err_s_axis_tdata (bist_err_tdata )
+      ,.err_s_axis_tvalid(bist_err_tvalid)
+      ,.err_s_axis_tready(bist_err_tready)
+      ,.err_count_o      (err_occ_usr    )
     );
-    // RIFL TX expects all bytes valid: TX tkeep forced high (whole 256-bit words).
-    assign s_axis_tkeep_gty_i[i] = '1;
+    // ---- PRBS BIST: config CDC into rifl_usr_clk, generator/checker, TX/RX mux ----
+    wire prbs_en_sync, prbs_clr_sync, prbs_perturb_sync;
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_en_cdc (
+       .dest_out(prbs_en_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_enable_all[i]));
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_clr_cdc (
+       .dest_out(prbs_clr_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_clear));
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_ptb_cdc (
+       .dest_out(prbs_perturb_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_seed_perturb[i]));
+    // quasi-static config bus (written before enable): {mode[1:0], min[15:0], max[15:0], seed[31:0]}
+    wire [65:0] prbs_cfg_sync;
+    xpm_cdc_array_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0), .WIDTH(66)) prbs_cfg_cdc (
+       .dest_out(prbs_cfg_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0)
+      ,.src_in({prbs_len_mode, prbs_min_len, prbs_max_len, prbs_seed}));
+
+    wire [axis_data_width_p-1:0]  fifo_tx_tdata, bist_tx_tdata;
+    wire [axis_keep_width_lp-1:0] bist_tx_tkeep;
+    wire fifo_tx_tlast, fifo_tx_tvalid, fifo_tx_tready;
+    wire bist_tx_tlast, bist_tx_tvalid, bist_tx_tready;
+    wire fifo_rx_tready, bist_rx_tready;
+    wire fifo_rx_tvalid = m_axis_tvalid_gty_o[i] & ~prbs_en_sync;
+    wire [axis_data_width_p-1:0] bist_err_tdata;
+    wire bist_err_tvalid, bist_err_tready;
+    wire [ERR_OCC_W-1:0] err_occ_usr;
+    wire [31:0] bist_err_count;
+
+    rifl_prbs_bist #(
+       .data_width_p(axis_data_width_p)
+      ,.packet_len_width_p(16)
+      ,.counter_width_p(32)
+    ) prbs_bist (
+       .clk_i(rifl_usr_clks[i]), .reset_i(rifl_usr_rsts[i])
+      ,.prbs_enable_i(prbs_en_sync), .clear_i(prbs_clr_sync)
+      ,.cfg_len_mode_i(prbs_cfg_sync[65:64]), .cfg_pkt_len_i(prbs_cfg_sync[47:32])
+      ,.cfg_pkt_len_min_i(prbs_cfg_sync[63:48]), .cfg_seed_i(prbs_cfg_sync[31:0])
+      ,.seed_perturb_i(prbs_perturb_sync)
+      ,.tx_tdata_o(bist_tx_tdata), .tx_tkeep_o(bist_tx_tkeep)
+      ,.tx_tlast_o(bist_tx_tlast), .tx_tvalid_o(bist_tx_tvalid), .tx_tready_i(bist_tx_tready)
+      ,.rx_tdata_i(m_axis_tdata_gty_o[i]), .rx_tkeep_i(m_axis_tkeep_gty_o[i])
+      ,.rx_tlast_i(m_axis_tlast_gty_o[i]), .rx_tvalid_i(m_axis_tvalid_gty_o[i] & prbs_en_sync)
+      ,.rx_tready_o(bist_rx_tready)
+      ,.error_count_o(bist_err_count)
+      ,.sent_packet_count_o(), .recv_packet_count_o()
+      ,.err_axis_tdata_o(bist_err_tdata), .err_axis_tlast_o()
+      ,.err_axis_tvalid_o(bist_err_tvalid), .err_axis_tready_i(bist_err_tready)
+    );
+
+    // TX: PRBS generator when enabled, else the software FIFO drain (RIFL expects
+    // all bytes valid in normal mode; the generator supplies its own last-beat tkeep).
+    assign s_axis_tdata_gty_i[i]  = prbs_en_sync ? bist_tx_tdata  : fifo_tx_tdata;
+    assign s_axis_tkeep_gty_i[i]  = prbs_en_sync ? bist_tx_tkeep  : '1;
+    assign s_axis_tlast_gty_i[i]  = prbs_en_sync ? bist_tx_tlast  : fifo_tx_tlast;
+    assign s_axis_tvalid_gty_i[i] = prbs_en_sync ? bist_tx_tvalid : fifo_tx_tvalid;
+    assign bist_tx_tready = prbs_en_sync  & s_axis_tready_gty_o[i];
+    assign fifo_tx_tready = ~prbs_en_sync & s_axis_tready_gty_o[i];
+    // RX: the RIFL m_axis feeds both consumers; only the selected one asserts tready.
+    assign m_axis_tready_gty_i[i] = prbs_en_sync ? bist_rx_tready : fifo_rx_tready;
 
     // RX data + packed-tkeep occupancies (rifl_usr_clk[i]) -> init_clk.
     wire [RX_OCC_W-1:0] rx_occ_sync, tkeep_occ_sync;
@@ -419,6 +502,26 @@ module rifl_subsystem
     );
     assign tx_desc_st[i] = 32'(tx_desc_sync);
     assign rx_pkt_st[i]  = 32'(rx_pkt_sync);
+
+    // PRBS corrupted-packet count + error-record FIFO occupancy (rifl_usr_clk[i]) -> init_clk.
+    wire [31:0]          prbs_err_sync;
+    wire [ERR_OCC_W-1:0] prbs_occ_sync;
+    xpm_cdc_gray #(
+       .DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .REG_OUTPUT(1)
+      ,.SIM_ASSERT_CHK(0), .SIM_LOSSLESS_GRAY_CHK(0), .WIDTH(32)
+    ) prbs_err_cdc (
+       .dest_out_bin(prbs_err_sync), .dest_clk(init_clk)
+      ,.src_clk(rifl_usr_clks[i]), .src_in_bin(bist_err_count)
+    );
+    xpm_cdc_gray #(
+       .DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .REG_OUTPUT(1)
+      ,.SIM_ASSERT_CHK(0), .SIM_LOSSLESS_GRAY_CHK(0), .WIDTH(ERR_OCC_W)
+    ) prbs_occ_cdc (
+       .dest_out_bin(prbs_occ_sync), .dest_clk(init_clk)
+      ,.src_clk(rifl_usr_clks[i]), .src_in_bin(err_occ_usr)
+    );
+    assign prbs_err_st[i] = prbs_err_sync;
+    assign prbs_occ_st[i] = 32'(prbs_occ_sync);
 
     // RIFL AXIS debug ILA -- synthesis/hardware only; define SIMULATION to drop it.
 `ifndef SIMULATION
@@ -559,8 +662,9 @@ module rifl_subsystem
   //            tx_send_pause, tx_send_retrans; index = base + link*4 + channel)
   //   [94..97] compensate   [98..101] rx_data_occupancy   [102..105] rx_tkeep_occupancy
   //   [106..109] tx_desc_occupancy (packets buffered)   [110..113] rx_pkt_count (packets received)
+  //   [114..117] prbs_error_count (corrupted packets)   [118..121] prbs_errfifo_occupancy
   localparam int EVT_PER_SIG    = num_gty_port_p*gt_serial_width_p;
-  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 5*num_gty_port_p; // 114
+  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 7*num_gty_port_p; // 122
 
   wire [CSR_NUM_STATUS-1:0][31:0] status_all;
   assign status_all[CSR_LVL_STATUS-1:0] = rifl_status_sync;
@@ -575,8 +679,10 @@ module rifl_subsystem
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + i]                    = evt_compensate_st[i];
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 1*num_gty_port_p + i] = rx_occ_st[i];
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 2*num_gty_port_p + i] = tkeep_occ_st[i];
-    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 3*num_gty_port_p + i] = tx_desc_st[i];  // 106+i
-    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 4*num_gty_port_p + i] = rx_pkt_st[i];   // 110+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 3*num_gty_port_p + i] = tx_desc_st[i];   // 106+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 4*num_gty_port_p + i] = rx_pkt_st[i];    // 110+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 5*num_gty_port_p + i] = prbs_err_st[i];  // 114+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 6*num_gty_port_p + i] = prbs_occ_st[i];  // 118+i
   end
 
   // ---------------------------------------------------------------------------
