@@ -53,9 +53,9 @@ set ::RIFL_ST_PRBS_OCC_BASE 0x218    ;# per-link PRBS error-record FIFO occupanc
 
 # PRBS BIST control registers
 set ::RIFL_CTRL1          0x04       ;# [3:0] per-link enable, [8] clear, [19:16] per-link seed-perturb
-set ::RIFL_PRBS_MAXLEN    0x08       ;# [15:0] max packet length (beats)
+set ::RIFL_PRBS_MASK      0x08       ;# [15:0] length mask (2^k-1); length = min + (lfsr & mask)
 set ::RIFL_PRBS_SEED      0x0C       ;# [31:0] PRBS + length seed
-set ::RIFL_PRBS_LENMODE   0x10       ;# [1:0] mode (0 fixed/1 sweep/2,3 random), [17:2] min length (beats)
+set ::RIFL_PRBS_MIN       0x10       ;# [17:2] min length (beats)
 
 # ctrl reg0 bit masks
 set ::RIFL_AXIS_EN        0x1
@@ -220,12 +220,17 @@ proc rifl_rx_pkt_occ  {link} { return [rifl_rd [expr {$::RIFL_ST_RXPKT_BASE  + 4
 proc rifl_prbs_err_cnt {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_ERR_BASE + 4*$link}]] }
 proc rifl_prbs_occ     {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_OCC_BASE + 4*$link}]] }
 # Configure the generators/checkers (write BEFORE enabling): seed, max length,
-# length mode (2/3 = random), min length.  Same seed on all links so each link's
-# checker matches its peer's generator.
-proc rifl_prbs_config {seed maxlen {mode 2} {minlen 1}} {
-  rifl_reg_wr $::RIFL_PRBS_SEED    $seed
-  rifl_reg_wr $::RIFL_PRBS_MAXLEN  [expr {$maxlen & 0xFFFF}]
-  rifl_reg_wr $::RIFL_PRBS_LENMODE [expr {($mode & 0x3) | (($minlen & 0xFFFF) << 2)}]
+# min length.  Length = min + (lfsr & mask); the mask is the smallest 2^k-1 that
+# covers (max-min), so a non-power-of-two max is rounded UP to a power-of-two
+# range.  Same seed on all links so each link's checker matches its peer's gen.
+proc rifl_prbs_config {seed maxlen {minlen 1}} {
+  set span [expr {$maxlen - $minlen}]
+  if {$span < 0} { set span 0 }
+  set mask 0
+  while {$mask < $span} { set mask [expr {($mask << 1) | 1}] }
+  rifl_reg_wr $::RIFL_PRBS_SEED $seed
+  rifl_reg_wr $::RIFL_PRBS_MASK [expr {$mask & 0xFFFF}]
+  rifl_reg_wr $::RIFL_PRBS_MIN  [expr {($minlen & 0xFFFF) << 2}]
 }
 # Enable a per-link mask (bit L).  Optional perturb mask (bit L) makes link L's
 # checker expect a different sequence than its peer sends -> guaranteed errors.

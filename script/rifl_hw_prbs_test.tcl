@@ -36,7 +36,7 @@ rifl_status
 
 # ---- healthy soak: PRBS on all links, shared seed, expect 0 errors ----
 puts [format "=== healthy soak: seed=0x%X, random length 1..%d beats, ~3 s ===" $SEED $MAXLEN]
-rifl_prbs_config $SEED $MAXLEN 2 1
+rifl_prbs_config $SEED $MAXLEN 1
 rifl_prbs_enable 0xF
 after 3000
 set toterr 0

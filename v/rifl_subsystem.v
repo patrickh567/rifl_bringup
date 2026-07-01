@@ -154,14 +154,13 @@ module rifl_subsystem
   // ---- PRBS BIST controls (init_clk; CDC'd per-link into rifl_usr_clk) ----
   // reg 1: [3:0] per-link PRBS enable, [8] clear (counts+error FIFO), [19:16] per-link
   //        seed-perturb (forces that link's checker to mismatch).
-  // reg 2: [15:0] max packet length (beats).  reg 3: [31:0] PRBS + length seed.
-  // reg 4: [1:0] length mode (0 fixed/1 sweep/2,3 random), [17:2] min length (beats).
+  // reg 2: [15:0] length mask (2^k-1); packet length = min + (lfsr & mask).
+  // reg 3: [31:0] PRBS + length seed.   reg 4: [17:2] min length (beats).
   wire [num_gty_port_p-1:0] prbs_enable_all   = csr[1][num_gty_port_p-1:0];
   wire                      prbs_clear        = csr[1][8];
   wire [num_gty_port_p-1:0] prbs_seed_perturb = csr[1][16 +: num_gty_port_p];
-  wire [15:0]               prbs_max_len      = csr[2][15:0];
+  wire [15:0]               prbs_len_mask     = csr[2][15:0];
   wire [31:0]               prbs_seed         = csr[3];
-  wire [1:0]                prbs_len_mode     = csr[4][1:0];
   wire [15:0]               prbs_min_len      = csr[4][17:2];
 
   wire [num_gty_port_p-1:0] rifl_rsts;
@@ -416,16 +415,21 @@ module rifl_subsystem
        .dest_out(prbs_clr_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_clear));
     xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_ptb_cdc (
        .dest_out(prbs_perturb_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_seed_perturb[i]));
-    // quasi-static config bus (written before enable): {mode[1:0], min[15:0], max[15:0], seed[31:0]}
-    wire [65:0] prbs_cfg_sync;
-    xpm_cdc_array_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0), .WIDTH(66)) prbs_cfg_cdc (
+    // quasi-static config bus (written before enable): {min[15:0], mask[15:0], seed[31:0]}
+    wire [63:0] prbs_cfg_sync;
+    xpm_cdc_array_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0), .WIDTH(64)) prbs_cfg_cdc (
        .dest_out(prbs_cfg_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0)
-      ,.src_in({prbs_len_mode, prbs_min_len, prbs_max_len, prbs_seed}));
+      ,.src_in({prbs_min_len, prbs_len_mask, prbs_seed}));
 
     wire [axis_data_width_p-1:0]  fifo_tx_tdata, bist_tx_tdata;
     wire [axis_keep_width_lp-1:0] bist_tx_tkeep;
     wire fifo_tx_tlast, fifo_tx_tvalid, fifo_tx_tready;
     wire bist_tx_tlast, bist_tx_tvalid, bist_tx_tready;
+    wire prbs_tx_active;                               // BIST generator running or draining
+    // TX owned by the generator while enabled OR while it finishes the current
+    // packet after a disable -- keeps the link on the generator through the
+    // graceful drain so no partial frame is left on the wire.
+    wire prbs_tx_sel = prbs_en_sync | prbs_tx_active;
     wire fifo_rx_tready, bist_rx_tready;
     wire fifo_rx_tvalid = m_axis_tvalid_gty_o[i] & ~prbs_en_sync;
     wire [axis_data_width_p-1:0] bist_err_tdata;
@@ -440,11 +444,12 @@ module rifl_subsystem
     ) prbs_bist (
        .clk_i(rifl_usr_clks[i]), .reset_i(rifl_usr_rsts[i])
       ,.prbs_enable_i(prbs_en_sync), .clear_i(prbs_clr_sync)
-      ,.cfg_len_mode_i(prbs_cfg_sync[65:64]), .cfg_pkt_len_i(prbs_cfg_sync[47:32])
+      ,.cfg_len_mask_i(prbs_cfg_sync[47:32])
       ,.cfg_pkt_len_min_i(prbs_cfg_sync[63:48]), .cfg_seed_i(prbs_cfg_sync[31:0])
       ,.seed_perturb_i(prbs_perturb_sync)
       ,.tx_tdata_o(bist_tx_tdata), .tx_tkeep_o(bist_tx_tkeep)
       ,.tx_tlast_o(bist_tx_tlast), .tx_tvalid_o(bist_tx_tvalid), .tx_tready_i(bist_tx_tready)
+      ,.tx_active_o(prbs_tx_active)
       ,.rx_tdata_i(m_axis_tdata_gty_o[i]), .rx_tkeep_i(m_axis_tkeep_gty_o[i])
       ,.rx_tlast_i(m_axis_tlast_gty_o[i]), .rx_tvalid_i(m_axis_tvalid_gty_o[i] & prbs_en_sync)
       ,.rx_tready_o(bist_rx_tready)
@@ -456,12 +461,12 @@ module rifl_subsystem
 
     // TX: PRBS generator when enabled, else the software FIFO drain (RIFL expects
     // all bytes valid in normal mode; the generator supplies its own last-beat tkeep).
-    assign s_axis_tdata_gty_i[i]  = prbs_en_sync ? bist_tx_tdata  : fifo_tx_tdata;
-    assign s_axis_tkeep_gty_i[i]  = prbs_en_sync ? bist_tx_tkeep  : '1;
-    assign s_axis_tlast_gty_i[i]  = prbs_en_sync ? bist_tx_tlast  : fifo_tx_tlast;
-    assign s_axis_tvalid_gty_i[i] = prbs_en_sync ? bist_tx_tvalid : fifo_tx_tvalid;
-    assign bist_tx_tready = prbs_en_sync  & s_axis_tready_gty_o[i];
-    assign fifo_tx_tready = ~prbs_en_sync & s_axis_tready_gty_o[i];
+    assign s_axis_tdata_gty_i[i]  = prbs_tx_sel ? bist_tx_tdata  : fifo_tx_tdata;
+    assign s_axis_tkeep_gty_i[i]  = prbs_tx_sel ? bist_tx_tkeep  : '1;
+    assign s_axis_tlast_gty_i[i]  = prbs_tx_sel ? bist_tx_tlast  : fifo_tx_tlast;
+    assign s_axis_tvalid_gty_i[i] = prbs_tx_sel ? bist_tx_tvalid : fifo_tx_tvalid;
+    assign bist_tx_tready = prbs_tx_sel  & s_axis_tready_gty_o[i];
+    assign fifo_tx_tready = ~prbs_tx_sel & s_axis_tready_gty_o[i];
     // RX: the RIFL m_axis feeds both consumers; only the selected one asserts tready.
     assign m_axis_tready_gty_i[i] = prbs_en_sync ? bist_rx_tready : fifo_rx_tready;
 
