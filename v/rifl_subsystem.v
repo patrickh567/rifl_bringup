@@ -528,8 +528,10 @@ module rifl_subsystem
     assign prbs_err_st[i] = prbs_err_sync;
     assign prbs_occ_st[i] = 32'(prbs_occ_sync);
 
-    // RIFL AXIS debug ILA -- synthesis/hardware only; define SIMULATION to drop it.
-`ifndef SIMULATION
+    // RIFL AXIS debug ILA -- DISABLED to relieve usr-clock routing congestion:
+    // the 4 per-link ILAs + debug hub crowd the RIFL/FIFO logic that is the
+    // timing bottleneck.  Define ENABLE_AXIS_ILA to re-include them for debug.
+`ifdef ENABLE_AXIS_ILA
     logic [15:0] m_axis_counter_r, s_axis_counter_r;
     logic [15:0] m_axis_counter_last_r, s_axis_counter_last_r;
     logic [15:0] m_axis_counter_tkeep_r, s_axis_counter_tkeep_r;

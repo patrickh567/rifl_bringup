@@ -17,8 +17,8 @@
 //     mask -- so the length path is an AND + add (no range/mask arithmetic).
 //   * The checker's compare is PIPELINED: the lightweight expected model (PRBS +
 //     length counters) runs single-cycle; the heavy path (256-bit XOR/mask ->
-//     256->1 reduce -> flag/record/count) is split across two pipeline registers,
-//     so error logging lands a couple cycles later (functionally identical).
+//     grouped OR -> 16->1 reduce -> flag/record/count) is split across three
+//     pipeline registers, so error logging lands a few cycles later (identical).
 //   * The generator's combinational data output is registered by a skid buffer in
 //     the subsystem before it reaches the link.
 //
@@ -237,10 +237,11 @@ module rifl_prbs_bist
   wire [keep_width_lp-1:0] rx_exp_keep = rx_exp_last ? rx_cur_keep_r : '1;
 
   // ---------------------------------------------------------------------------
-  // Compare pipeline.
+  // Compare pipeline (kept shallow for the ~390 MHz clock).
   //   p1 : model output registered (expected + received + metadata).
-  //   p2 : masked XOR (256-bit diff) + length/tkeep mismatch flags registered.
-  //   stage 2 : 256->1 reduce, flag, per-packet accumulate, count + record.
+  //   p2 : masked XOR -> grouped 16-bit OR + length/tkeep mismatch flags.
+  //   p3 : 16->1 reduce to a single data-mismatch bit + forward.
+  //   stage 3 : flag, per-packet accumulate, count + record.
   // ---------------------------------------------------------------------------
   logic                       p1_valid;
   logic [data_width_p-1:0]    p1_exp_data, p1_rcv_data;
@@ -257,14 +258,20 @@ module rifl_prbs_bist
   logic [counter_width_p-1:0] p2_pkt_idx;
   logic [31:0]                p2_flit_idx;
 
+  logic                       p3_valid, p3_data_mm, p3_last_mm, p3_tkeep_mm;
+  logic [data_width_p-1:0]    p3_exp_data, p3_rcv_data;
+  logic [keep_width_lp-1:0]   p3_exp_keep, p3_rcv_keep;
+  logic                       p3_exp_last, p3_rcv_last;
+  logic [counter_width_p-1:0] p3_pkt_idx;
+  logic [31:0]                p3_flit_idx;
+
   // masked byte-wise difference (registered as a grouped-OR into p2, then reduced
   // in stage 2 -- keeps both stages shallow instead of one deep 256->1 reduce).
   wire [data_width_p-1:0] p1_masked = (p1_exp_data ^ p1_rcv_data) & keep_to_bits(p1_exp_keep);
 
-  // stage-2 decode of p2
-  wire        s2_data_mm = |p2_partial;
-  wire        s2_flit_err = p2_valid & (s2_data_mm | p2_last_mm | p2_tkeep_mm);
-  wire [7:0]  s2_flags    = {p2_exp_last, p2_rcv_last, 2'b00, p2_tkeep_mm, p2_last_mm, s2_data_mm, 1'b0};
+  // stage-3 decode of p3 (the 16->1 reduce is registered into p3_data_mm)
+  wire        s3_flit_err = p3_valid & (p3_data_mm | p3_last_mm | p3_tkeep_mm);
+  wire [7:0]  s3_flags    = {p3_exp_last, p3_rcv_last, 2'b00, p3_tkeep_mm, p3_last_mm, p3_data_mm, 1'b0};
 
   logic                       pkt_err_r;             // this packet mismatched somewhere (stage 2)
   logic [counter_width_p-1:0] rec_pkt_idx_r;
@@ -274,15 +281,15 @@ module rifl_prbs_bist
   logic [7:0]                 rec_flags_r;
 
   // record content: latched first-divergence fields, or -- when the first error
-  // is on this very (last) beat -- the current stage-2 beat's fields.
-  wire                       pkt_err_now = pkt_err_r | s2_flit_err;
-  wire [counter_width_p-1:0] q_pkt_idx   = pkt_err_r ? rec_pkt_idx_r  : p2_pkt_idx;
-  wire [31:0]                q_flit_idx  = pkt_err_r ? rec_flit_idx_r : p2_flit_idx;
-  wire [data_width_p-1:0]    q_exp_data  = pkt_err_r ? rec_exp_data_r : p2_exp_data;
-  wire [data_width_p-1:0]    q_rcv_data  = pkt_err_r ? rec_rcv_data_r : p2_rcv_data;
-  wire [keep_width_lp-1:0]   q_exp_keep  = pkt_err_r ? rec_exp_keep_r : p2_exp_keep;
-  wire [keep_width_lp-1:0]   q_rcv_keep  = pkt_err_r ? rec_rcv_keep_r : p2_rcv_keep;
-  wire [7:0]                 q_flags     = pkt_err_r ? rec_flags_r    : s2_flags;
+  // is on this very (last) beat -- the current stage-3 beat's fields.
+  wire                       pkt_err_now = pkt_err_r | s3_flit_err;
+  wire [counter_width_p-1:0] q_pkt_idx   = pkt_err_r ? rec_pkt_idx_r  : p3_pkt_idx;
+  wire [31:0]                q_flit_idx  = pkt_err_r ? rec_flit_idx_r : p3_flit_idx;
+  wire [data_width_p-1:0]    q_exp_data  = pkt_err_r ? rec_exp_data_r : p3_exp_data;
+  wire [data_width_p-1:0]    q_rcv_data  = pkt_err_r ? rec_rcv_data_r : p3_rcv_data;
+  wire [keep_width_lp-1:0]   q_exp_keep  = pkt_err_r ? rec_exp_keep_r : p3_exp_keep;
+  wire [keep_width_lp-1:0]   q_rcv_keep  = pkt_err_r ? rec_rcv_keep_r : p3_rcv_keep;
+  wire [7:0]                 q_flags     = pkt_err_r ? rec_flags_r    : s3_flags;
   wire [data_width_p-1:0]    q_beat2 =
        { {(data_width_p-136){1'b0}}, q_flags, q_rcv_keep, q_exp_keep, q_flit_idx, q_pkt_idx };
 
@@ -295,8 +302,8 @@ module rifl_prbs_bist
   assign err_axis_tdata_o  = emit_rec_r[emit_cnt_r*data_width_p +: data_width_p];
   assign err_axis_tlast_o  = (emit_cnt_r == 2'd2);
 
-  // push a record on the (stage-2) packet boundary if it mismatched and the emitter is free
-  wire push_now = p2_valid & p2_rcv_last & pkt_err_now & ~emit_busy_r;
+  // push a record on the (stage-3) packet boundary if it mismatched and the emitter is free
+  wire push_now = p3_valid & p3_rcv_last & pkt_err_now & ~emit_busy_r;
 
   always_ff @(posedge clk_i) begin
     if (reset_i | clear_i) begin
@@ -309,6 +316,7 @@ module rifl_prbs_bist
       rx_pkt_idx_r        <= '0;
       p1_valid            <= 1'b0;
       p2_valid            <= 1'b0;
+      p3_valid            <= 1'b0;
       pkt_err_r           <= 1'b0;
       error_count_o       <= '0;
       sent_packet_count_o <= '0;
@@ -332,6 +340,7 @@ module rifl_prbs_bist
         rx_pkt_idx_r        <= '0;
         p1_valid            <= 1'b0;
         p2_valid            <= 1'b0;
+        p3_valid            <= 1'b0;
         pkt_err_r           <= 1'b0;
         error_count_o       <= '0;
         recv_packet_count_o <= '0;
@@ -366,7 +375,7 @@ module rifl_prbs_bist
           p1_pkt_idx  <= rx_pkt_idx_r;  p1_flit_idx <= 32'(rx_flit_idx_r);
         end
 
-        // ---- pipeline stage p2: masked XOR + length/tkeep mismatch flags ----
+        // ---- pipeline stage p2: masked XOR -> grouped 16-bit OR + mismatch flags ----
         p2_valid <= p1_valid;
         if (p1_valid) begin
           for (int g = 0; g < data_width_p/16; g++) p2_partial[g] <= |p1_masked[g*16 +: 16];
@@ -378,16 +387,27 @@ module rifl_prbs_bist
           p2_pkt_idx  <= p1_pkt_idx;    p2_flit_idx <= p1_flit_idx;
         end
 
-        // ---- stage 2: reduce, flag, accumulate, count + record ----
+        // ---- pipeline stage p3: 16->1 reduce to a single data-mismatch bit ----
+        p3_valid <= p2_valid;
         if (p2_valid) begin
-          if (s2_flit_err & ~pkt_err_r) begin           // latch the first divergence
-            rec_pkt_idx_r  <= p2_pkt_idx;  rec_flit_idx_r <= p2_flit_idx;
-            rec_exp_data_r <= p2_exp_data; rec_rcv_data_r <= p2_rcv_data;
-            rec_exp_keep_r <= p2_exp_keep; rec_rcv_keep_r <= p2_rcv_keep;
-            rec_flags_r    <= s2_flags;
+          p3_data_mm  <= |p2_partial;
+          p3_last_mm  <= p2_last_mm;     p3_tkeep_mm <= p2_tkeep_mm;
+          p3_exp_data <= p2_exp_data;    p3_rcv_data <= p2_rcv_data;
+          p3_exp_keep <= p2_exp_keep;    p3_rcv_keep <= p2_rcv_keep;
+          p3_exp_last <= p2_exp_last;    p3_rcv_last <= p2_rcv_last;
+          p3_pkt_idx  <= p2_pkt_idx;     p3_flit_idx <= p2_flit_idx;
+        end
+
+        // ---- stage 3: flag, accumulate, count + record ----
+        if (p3_valid) begin
+          if (s3_flit_err & ~pkt_err_r) begin           // latch the first divergence
+            rec_pkt_idx_r  <= p3_pkt_idx;  rec_flit_idx_r <= p3_flit_idx;
+            rec_exp_data_r <= p3_exp_data; rec_rcv_data_r <= p3_rcv_data;
+            rec_exp_keep_r <= p3_exp_keep; rec_rcv_keep_r <= p3_rcv_keep;
+            rec_flags_r    <= s3_flags;
             pkt_err_r      <= 1'b1;
           end
-          if (p2_rcv_last) begin                         // packet boundary in stage 2
+          if (p3_rcv_last) begin                         // packet boundary in stage 3
             if (pkt_err_now & (error_count_o != '1)) error_count_o <= error_count_o + counter_width_p'(1);
             if (recv_packet_count_o != '1)            recv_packet_count_o <= recv_packet_count_o + counter_width_p'(1);
             pkt_err_r <= 1'b0;

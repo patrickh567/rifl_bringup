@@ -40,6 +40,9 @@ if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} {
 puts "INFO: synthesis complete."
 
 # ---- implementation -> bitstream ----
+# Performance_ExplorePostRoutePhysOpt (explore place/route + post-route phys-opt).
+# The aggressive AggressiveExplore/ExtraTimingOpt overrides were tried and made
+# the ~390 MHz usr clock worse (-0.369 vs -0.215), so use the base strategy.
 set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
 reset_run impl_1
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs

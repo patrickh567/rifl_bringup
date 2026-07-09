@@ -65,27 +65,31 @@ set_async_constraint $core_clk_name $usr_clks_2_name
 set_async_constraint $core_clk_name $usr_clks_3_name
 
 # -----------------------------------------------------------------------------
-# Per-link placement: keep each link's clock converter, TX/RX FIFO and RIFL core
-# in the clock-region row of its GTY quad.  (delete any pre-existing pblocks first
-# so this is safe to re-apply -- the constraints run at both synth and impl.)
+# Per-link placement: keep each link's clock converter, TX/RX FIFO, PRBS BIST and
+# RIFL core in the two clock-region rows at its GTY quad -- the quad's own row plus
+# the one below it (extended down; verified to stay within the quad's SLR).  The
+# BIST is a pblock member so its generator/checker place next to the RIFL core they
+# drive; two rows (rather than one) give the whole per-link group room to spread.
+# (delete any pre-existing pblocks first so this is safe to re-apply -- the
+# constraints run at both synth and impl.)
 # -----------------------------------------------------------------------------
 foreach pb [get_pblocks -quiet] { delete_pblock $pb }
 create_pblock pblock_rifl_0
 add_cells_to_pblock [get_pblocks pblock_rifl_0] [get_cells -quiet [list \
-  {u_clock_converters/cc[0].u_cc} {u_rifl_subsystem/nm[0].txrx_fifo} {u_rifl_subsystem/RIFL_inst_0}]]
-resize_pblock [get_pblocks pblock_rifl_0] -add {CLOCKREGION_X0Y7:CLOCKREGION_X3Y7}
+  {u_clock_converters/cc[0].u_cc} {u_rifl_subsystem/nm[0].txrx_fifo} {u_rifl_subsystem/nm[0].prbs_bist} {u_rifl_subsystem/RIFL_inst_0}]]
+resize_pblock [get_pblocks pblock_rifl_0] -add {CLOCKREGION_X0Y6:CLOCKREGION_X3Y7}
 
 create_pblock pblock_rifl_1
 add_cells_to_pblock [get_pblocks pblock_rifl_1] [get_cells -quiet [list \
-  {u_clock_converters/cc[1].u_cc} {u_rifl_subsystem/nm[1].txrx_fifo} {u_rifl_subsystem/RIFL_inst_1}]]
-resize_pblock [get_pblocks pblock_rifl_1] -add {CLOCKREGION_X0Y9:CLOCKREGION_X3Y9}
+  {u_clock_converters/cc[1].u_cc} {u_rifl_subsystem/nm[1].txrx_fifo} {u_rifl_subsystem/nm[1].prbs_bist} {u_rifl_subsystem/RIFL_inst_1}]]
+resize_pblock [get_pblocks pblock_rifl_1] -add {CLOCKREGION_X0Y8:CLOCKREGION_X3Y9}
 
 create_pblock pblock_rifl_2
 add_cells_to_pblock [get_pblocks pblock_rifl_2] [get_cells -quiet [list \
-  {u_clock_converters/cc[2].u_cc} {u_rifl_subsystem/nm[2].txrx_fifo} {u_rifl_subsystem/RIFL_inst_2}]]
-resize_pblock [get_pblocks pblock_rifl_2] -add {CLOCKREGION_X0Y11:CLOCKREGION_X3Y11}
+  {u_clock_converters/cc[2].u_cc} {u_rifl_subsystem/nm[2].txrx_fifo} {u_rifl_subsystem/nm[2].prbs_bist} {u_rifl_subsystem/RIFL_inst_2}]]
+resize_pblock [get_pblocks pblock_rifl_2] -add {CLOCKREGION_X0Y10:CLOCKREGION_X3Y11}
 
 create_pblock pblock_rifl_3
 add_cells_to_pblock [get_pblocks pblock_rifl_3] [get_cells -quiet [list \
-  {u_clock_converters/cc[3].u_cc} {u_rifl_subsystem/nm[3].txrx_fifo} {u_rifl_subsystem/RIFL_inst_3}]]
-resize_pblock [get_pblocks pblock_rifl_3] -add {CLOCKREGION_X4Y5:CLOCKREGION_X7Y5}
+  {u_clock_converters/cc[3].u_cc} {u_rifl_subsystem/nm[3].txrx_fifo} {u_rifl_subsystem/nm[3].prbs_bist} {u_rifl_subsystem/RIFL_inst_3}]]
+resize_pblock [get_pblocks pblock_rifl_3] -add {CLOCKREGION_X4Y4:CLOCKREGION_X7Y5}
