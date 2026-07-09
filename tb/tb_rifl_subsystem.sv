@@ -4,7 +4,10 @@
 // -----------------------------------------------------------------------------
 // tb_rifl_subsystem: testbench for rifl_subsystem.
 //
-// First (and only) test: send and receive a single-word packet on each RIFL link.
+// Test: buffer M packets on each RIFL link (packet p has PKT_WORDS+p 256-bit words,
+// so they are different sizes), drain them, and check each is received correctly and
+// boundary-framed on its peer.  Run-time plusargs: +PKT_WORDS=N (base size, default 1,
+// max 256), +NUM_PKTS=M (packets buffered before draining, default 1, max 16).
 //
 // The testbench drives rifl_subsystem's converter-side AXI ports (cc_*, one full AXI4
 // per link, in that link's rifl_usr_clk domain) and the lite register-map port
@@ -12,9 +15,11 @@
 // serial (link 0<->1, 2<->3): each link's TX feeds its PEER's RX (peer = link ^ 1),
 // so a packet transmitted on one link is received by its peer (no self-loopback).
 //
-// Sequence: reset RIFL -> wait for all links up -> reset converters/FIFOs ->
-// enable streaming -> per link: AXI-write one word (transmit), poll RX occupancy,
-// AXI-read one word (receive), check it matches.
+// Sequence: reset RIFL -> wait for all links up -> reset converters/FIFOs -> per link,
+// with the stream disabled, write+COMMIT M packets (awaddr[15]=1 commits each packet's
+// length as a descriptor) -> enable the stream so the descriptor FIFO drains each as
+// its own TLAST packet to the peer -> per link, wait for M packets (rx_pkt_count), read
+// each packet's length from the RX length FIFO (0xC000) and its words, and check all.
 //
 // NOTE: running this requires the real RIFL / GTY / firmware_bd (MMCM) / debug-core
 // simulation models and the Xilinx unisim/secureip libraries; GT bring-up takes a
@@ -31,7 +36,17 @@ module tb_rifl_subsystem;
   localparam logic [31:0] REG_CTRL0   = 32'h0000_0000;          // bit0 enable, bit1 cc_reset, bit2 core_reset
   localparam logic [31:0] STAT_RX_UP  = 32'h0000_0040;          // status reg 0
   localparam logic [31:0] STAT_RXOCC0 = 32'h0000_0040 + 32'd98*4; // status reg 98 (rx data occupancy, link 0)
-  localparam logic [31:0] RX_DATA_ADDR = 32'h0000_0000;         // cc read, araddr[15]=0 -> RX data FIFO
+  localparam logic [31:0] RX_DATA_ADDR = 32'h0000_0000;         // cc read,  araddr[15:14]=0x -> RX data FIFO
+  localparam logic [31:0] RX_LEN_ADDR  = 32'h0000_C000;         // cc read,  araddr[15:14]=11 -> RX length FIFO (beat-count/packet)
+  localparam logic [31:0] TX_COMMIT_ADDR = 32'h0000_8000;       // cc write, awaddr[15]=1     -> commit a TX packet descriptor
+  localparam logic [31:0] STAT_RXPKT0 = 32'h0000_0040 + 32'd110*4; // status reg 110 (rx packet count, link 0)
+  // PRBS BIST control (reg 1..4) + status (reg 114 err, reg 118 occ), per rifl_hw_lib.tcl
+  localparam logic [31:0] REG_CTRL1     = 32'h0000_0004;        // [3:0] per-link enable, [8] clear, [19:16] perturb
+  localparam logic [31:0] PRBS_MASK     = 32'h0000_0008;        // [15:0] length mask (2^k-1); len = min + (lfsr & mask)
+  localparam logic [31:0] PRBS_SEED     = 32'h0000_000C;        // [31:0] PRBS + length seed
+  localparam logic [31:0] PRBS_MIN      = 32'h0000_0010;        // [17:2] min length (beats)
+  localparam logic [31:0] STAT_PRBSERR0 = 32'h0000_0040 + 32'd114*4; // reg 114 per-link corrupted-packet count
+  localparam logic [31:0] STAT_PRBSOCC0 = 32'h0000_0040 + 32'd118*4; // reg 118 per-link error-record FIFO occupancy
 
   // ---- input clocks ----
   logic ext_refclk_p = 1'b0;        // 200 MHz LVDS -> firmware_bd MMCM
@@ -220,15 +235,49 @@ module tb_rifl_subsystem;
   endtask
 
   // ---- test ----
+  localparam int MAX_PKT_WORDS = 256;            // largest single packet (got_arr); data FIFO is 512 deep
+  localparam int MAX_PKTS      = 16;             // most packets buffered per link before draining
+  localparam int FIFO_BUDGET   = 500;            // keep total buffered words under the 512-deep data FIFO
   integer errors = 0;
   integer poll;
-  logic [31:0] rdw;
-  logic [255:0] word [num_gty_port_p];
-  logic [255:0] got, expw;
-  integer i;
+  integer i, j, p, psz, total, rxlen, rd_n;
+  int     pkt_words;                             // base packet length in 256-bit words (+PKT_WORDS=N)
+  int     num_pkts;                              // packets buffered per link before drain (+NUM_PKTS=M)
+  logic         link_ok;
+  logic [31:0]  rdw;
+  logic [255:0] word    [num_gty_port_p][MAX_PKTS][MAX_PKT_WORDS];
+  logic [255:0] got_arr [MAX_PKT_WORDS];
+  logic [255:0] len_word;                        // RX length-FIFO entry (received packet's beat-count)
+  int          prbs_us;                          // PRBS BIST soak duration in us (+PRBS_US=N; 0 => packet mode)
+  int          prbs_maxlen;                       // PRBS max packet length in beats (+PRBS_MAXLEN)
+  logic [31:0] prbs_seed, prbs_mask, occ_rdw;    // PRBS seed, derived length mask, occupancy read
+  integer      span;
 
   initial begin
     init_axi();
+
+    // Run-time selectable: +PKT_WORDS=N (base packet size, words) and +NUM_PKTS=M
+    // (packets buffered per link before draining).  Packet p has size N+p, so M>1
+    // pushes several DIFFERENT-size packets through the descriptor FIFO at once.
+    if (!$value$plusargs("PKT_WORDS=%d", pkt_words)) pkt_words = 1;
+    if (!$value$plusargs("NUM_PKTS=%d",  num_pkts )) num_pkts  = 1;
+    if (pkt_words < 1) pkt_words = 1;
+    if (num_pkts  < 1) num_pkts  = 1;
+    if (num_pkts  > MAX_PKTS)      num_pkts  = MAX_PKTS;
+    if (pkt_words > MAX_PKT_WORDS) pkt_words = MAX_PKT_WORDS;
+    // largest single packet (N+M-1) must fit got_arr; total buffered words must fit the FIFO
+    while (num_pkts > 1 && (pkt_words + num_pkts - 1) > MAX_PKT_WORDS) num_pkts--;
+    while (num_pkts > 1 && (num_pkts*pkt_words + (num_pkts*(num_pkts-1))/2) > FIFO_BUDGET) num_pkts--;
+    total = num_pkts*pkt_words + (num_pkts*(num_pkts-1))/2;
+    $display("[%0t] tb_rifl_subsystem: PKT_WORDS=%0d NUM_PKTS=%0d (sizes %0d..%0d, %0d words/link total)",
+             $time, pkt_words, num_pkts, pkt_words, pkt_words+num_pkts-1, total);
+
+    // +PRBS_US=N (>0) selects PRBS BIST soak mode (built-in generator/checker) instead
+    // of the packet test; +PRBS_MAXLEN sets the max random packet length, +PRBS_SEED the seed.
+    if (!$value$plusargs("PRBS_US=%d",     prbs_us))     prbs_us     = 0;
+    if (!$value$plusargs("PRBS_MAXLEN=%d", prbs_maxlen)) prbs_maxlen = 64;
+    if (!$value$plusargs("PRBS_SEED=%h",   prbs_seed))   prbs_seed   = 32'hDEAD_BEEF;
+    if (prbs_maxlen < 1) prbs_maxlen = 1;
 
     // wait for init_clk (firmware_bd MMCM) to start toggling
     repeat (50) @(posedge init_clk);
@@ -249,8 +298,12 @@ module tb_rifl_subsystem;
       lite_rd(STAT_RX_UP, rdw);
       poll++;
       if (poll % 1000 == 0) $display("[%0t] waiting for rx_up: 0x%08x", $time, rdw);
-    end while ((rdw[gt_w_lp-1:0] != {gt_w_lp{1'b1}}) && (poll < 200000));
-    if (rdw[gt_w_lp-1:0] != {gt_w_lp{1'b1}}) begin
+    // case-inequality (!==): rx_up lives in the GT recovered-clock domain and
+    // reads X until that clock starts, so a plain `!=` ((X != 1)->X->false) would
+    // treat an all-X status as "links up" and march on over a dead link.  `!==`
+    // keeps polling until the bits are genuinely all 1.
+    end while ((rdw[gt_w_lp-1:0] !== {gt_w_lp{1'b1}}) && (poll < 200000));
+    if (rdw[gt_w_lp-1:0] !== {gt_w_lp{1'b1}}) begin
       $error("[%0t] timeout waiting for RIFL links up (rx_up=0x%08x)", $time, rdw);
       errors++;
     end else begin
@@ -263,50 +316,135 @@ module tb_rifl_subsystem;
     lite_wr(REG_CTRL0, 32'h0000_0000);
     repeat (50) @(posedge init_clk);
 
-    // 4) enable the AXI-Stream (TX drain) on all FIFOs (reg 0 bit 0)
-    lite_wr(REG_CTRL0, 32'h0000_0001);
-
-    // 5) transmit one word on each link, then receive it on the paired peer.
-    //    A word sent on link i arrives at link (i^1)'s RX (the peer it is wired to).
-    for (i = 0; i < num_gty_port_p; i++)
-      word[i] = 256'hC0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE + i;
-
-    for (i = 0; i < num_gty_port_p; i++) begin
-      axi_wr(i, 32'h0, word[i]);
-      $display("[%0t] link %0d: transmitted 0x%064x", $time, i, word[i]);
+    // ===== PRBS BIST soak mode (+PRBS_US>0): drive the built-in per-link PRBS
+    //       generator/checker for a long random sequence, confirm ZERO errors on
+    //       every link, then perturb link 0's checker to prove it actually detects
+    //       mismatches.  (Falls through to the packet test when +PRBS_US=0.) =====
+    if (prbs_us > 0) begin
+      // random packet length = 1 + (lfsr & mask); grow mask to a 2^k-1 span >= maxlen-1
+      span = prbs_maxlen - 1; if (span < 0) span = 0;
+      prbs_mask = 32'h0; while (prbs_mask < span) prbs_mask = (prbs_mask << 1) | 32'h1;
+      lite_wr(PRBS_SEED, prbs_seed);
+      lite_wr(PRBS_MASK, prbs_mask & 32'h0000_FFFF);
+      lite_wr(PRBS_MIN,  (32'd1 & 32'h0000_FFFF) << 2);         // min length 1 beat
+      // enable PRBS on all 4 links (perturb=0); the enable rising edge zeroes counters
+      lite_wr(REG_CTRL1, 32'h0000_0000);
+      repeat (20) @(posedge init_clk);
+      lite_wr(REG_CTRL1, 32'h0000_000F);
+      $display("[%0t] PRBS enabled on all 4 links (seed=0x%08x, lengths 1..%0d beats); soaking %0d us ...",
+               $time, prbs_seed, prbs_maxlen, prbs_us);
+      #(prbs_us * 1_000_000);                                    // <-- the long PRBS sequence
+      lite_wr(REG_CTRL1, 32'h0000_0000);                         // graceful disable
+      repeat (500) @(posedge init_clk);
+      // healthy result: every link's corrupted-packet count must be 0
+      for (i = 0; i < num_gty_port_p; i++) begin
+        lite_rd(STAT_PRBSERR0 + i*4, rdw);
+        lite_rd(STAT_PRBSOCC0 + i*4, occ_rdw);
+        $display("[%0t] link %0d: prbs_err=%0d errfifo_occ=%0d  %s", $time, i, rdw, occ_rdw, (rdw==0)?"OK":"<-- ERRORS");
+        if (rdw !== 32'd0) errors++;
+      end
+      // liveness sanity: perturb link 0's checker -> its error count must climb
+      lite_wr(REG_CTRL1, 32'h0001_0000);                         // perturb link 0, enable low
+      repeat (20) @(posedge init_clk);
+      lite_wr(REG_CTRL1, 32'h0001_000F);                         // enable all + perturb link 0
+      #(20 * 1_000_000);
+      lite_wr(REG_CTRL1, 32'h0000_0000);
+      repeat (500) @(posedge init_clk);
+      lite_rd(STAT_PRBSERR0, rdw);
+      lite_rd(STAT_PRBSOCC0, occ_rdw);
+      $display("[%0t] forced-error link 0: prbs_err=%0d errfifo_occ=%0d (expect > 0)", $time, rdw, occ_rdw);
+      if (rdw === 32'd0) begin errors++; $error("[%0t] forced error NOT detected -- checker inactive", $time); end
+      if (errors == 0) $display("==== TB PASSED: PRBS soak %0d us, 0 errors on all 4 links; forced error caught ====", prbs_us);
+      else             $display("==== TB FAILED: %0d error(s) in PRBS test ====", errors);
+      $finish;
     end
 
+    // 4) FILL each link with NUM_PKTS packets (packet p has pkt_words+p words) and COMMIT
+    //    each, all with the AXI-Stream drain DISABLED.  TX framing is descriptor-driven:
+    //    writes to awaddr[15]==0 push data words (accumulating the running length); a
+    //    write to awaddr[15]==1 (TX_COMMIT_ADDR) records that length as one descriptor and
+    //    begins the next packet.  Several different-size packets thus sit buffered;
+    //    enabling the drain releases each as its own TLAST-bounded packet.  Each word is
+    //    unique per (link,packet,beat) -> ordering + framing + peer-pairing all checked.
+    for (i = 0; i < num_gty_port_p; i++)
+      for (p = 0; p < num_pkts; p++)
+        for (j = 0; j < pkt_words + p; j++)
+          word[i][p][j] = 256'hC0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE + i*65536 + p*256 + j;
+
     for (i = 0; i < num_gty_port_p; i++) begin
-      // link i receives the word transmitted by its peer (i^1)
+      for (p = 0; p < num_pkts; p++) begin
+        for (j = 0; j < pkt_words + p; j++) axi_wr(i, 32'h0, word[i][p][j]); // DATA   (awaddr[15]=0)
+        axi_wr(i, TX_COMMIT_ADDR, 256'h0);                                   // COMMIT (awaddr[15]=1)
+      end
+      $display("[%0t] link %0d: filled+committed %0d packet(s), sizes %0d..%0d words", $time, i, num_pkts, pkt_words, pkt_words+num_pkts-1);
+    end
+
+    // 5) enable the AXI-Stream drain on all FIFOs (reg 0 bit 0): each TX FIFO now
+    //    releases its buffered packet to its peer over the RIFL link.
+    lite_wr(REG_CTRL0, 32'h0000_0001);
+
+    // 6) on each link, wait for all NUM_PKTS packets from its peer (rx_pkt_count, reg
+    //    110+i), then read them back boundary-aware: per packet, read its framed length
+    //    from the RX length FIFO (0xC000), confirm it equals pkt_words+p, then read that
+    //    many data words and check each against what the peer sent (in order).
+    for (i = 0; i < num_gty_port_p; i++) begin
       poll = 0;
       do begin
-        lite_rd(STAT_RXOCC0 + i*4, rdw);
+        lite_rd(STAT_RXPKT0 + i*4, rdw);
         poll++;
-      end while ((rdw[15:0] == 16'd0) && (poll < 200000));
-      if (rdw[15:0] == 16'd0) begin
-        $error("[%0t] link %0d: timeout waiting for RX data from peer %0d", $time, i, i^1);
+      end while ((rdw[15:0] < num_pkts) && (poll < 400000));
+      if (rdw[15:0] < num_pkts) begin
+        $error("[%0t] link %0d: timeout waiting for %0d packets from peer %0d (rx_pkt_count=%0d)", $time, i, num_pkts, i^1, rdw[15:0]);
         errors++;
       end else begin
-        axi_rd(i, RX_DATA_ADDR, got);
-        expw = word[i ^ 1];
-        if (got === expw)
-          $display("[%0t] link %0d: received 0x%064x from peer %0d  PASS", $time, i, got, i^1);
-        else begin
-          $error("[%0t] link %0d: received 0x%064x expected 0x%064x (peer %0d)", $time, i, got, expw, i^1);
-          errors++;
+        link_ok = 1'b1;
+        for (p = 0; p < num_pkts; p++) begin
+          psz = pkt_words + p;                          // expected size of peer's packet p
+          // packet-boundary check: the length-FIFO entry is this packet's beat-count
+          axi_rd(i, RX_LEN_ADDR, len_word);
+          rxlen = len_word[15:0];
+          if (rxlen !== psz[15:0]) begin
+            link_ok = 1'b0; errors++;
+            $error("[%0t] link %0d pkt %0d: received length %0d, expected %0d (peer %0d)",
+                   $time, i, p, rxlen, psz, i^1);
+          end
+          // read the words this packet actually carried (keeps FIFOs in sync), check each
+          rd_n = (rxlen > MAX_PKT_WORDS) ? MAX_PKT_WORDS : rxlen;
+          for (j = 0; j < rd_n; j++) begin
+            axi_rd(i, RX_DATA_ADDR, got_arr[j]);
+            if (j < psz && got_arr[j] !== word[i ^ 1][p][j]) begin
+              link_ok = 1'b0; errors++;
+              $error("[%0t] link %0d pkt %0d word %0d: received 0x%064x expected 0x%064x (peer %0d)",
+                     $time, i, p, j, got_arr[j], word[i^1][p][j], i^1);
+            end
+          end
         end
+        if (link_ok)
+          $display("[%0t] link %0d: received %0d packet(s) (sizes %0d..%0d, lengths ok) from peer %0d, all words match  PASS",
+                   $time, i, num_pkts, pkt_words, pkt_words+num_pkts-1, i^1);
       end
     end
 
-    if (errors == 0) $display("==== TB PASSED: single-word packet on all %0d links ====", num_gty_port_p);
-    else             $display("==== TB FAILED: %0d error(s) ====", errors);
+    if (errors == 0) $display("==== TB PASSED: %0d packet(s)/link (sizes %0d..%0d words) on all %0d links ====", num_pkts, pkt_words, pkt_words+num_pkts-1, num_gty_port_p);
+    else             $display("==== TB FAILED: %0d error(s) (PKT_WORDS=%0d NUM_PKTS=%0d) ====", errors, pkt_words, num_pkts);
     $finish;
   end
 
   // ---- global watchdog ----
+  // Scales with packet size: link bring-up is ~36 us, the single-word test passes
+  // ~38 us, and larger packets add ~1 us/word.  (timescale is 1ps, so the original
+  // `#50_000_000_000 // 50 us` was actually 50 ms.)
   initial begin
-    #50_000_000_000;   // 50 us
-    $error("[%0t] global timeout", $time);
+    int wpw, wnp, wtot, wprbs;
+    if (!$value$plusargs("PKT_WORDS=%d", wpw))   wpw   = 1;
+    if (!$value$plusargs("NUM_PKTS=%d",  wnp))   wnp   = 1;
+    if (!$value$plusargs("PRBS_US=%d",   wprbs)) wprbs = 0;
+    if (wpw < 1) wpw = 1;  if (wpw > 256) wpw = 256;
+    if (wnp < 1) wnp = 1;  if (wnp > 16)  wnp = 16;
+    wtot = wnp*wpw + (wnp*(wnp-1))/2;   // total buffered words/link
+    if (wprbs > 0) #((wprbs + 120) * 1_000_000);   // bring-up + PRBS soak + forced-error + margin
+    else           #((80 + wtot) * 1_000_000);     // ~80us bring-up + ~1us/word, generous
+    $error("[%0t] global timeout (PKT_WORDS=%0d NUM_PKTS=%0d PRBS_US=%0d)", $time, wpw, wnp, wprbs);
     $finish;
   end
 

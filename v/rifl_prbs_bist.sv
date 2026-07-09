@@ -114,13 +114,18 @@ module rifl_prbs_bist
     (input [packet_len_width_p-1:0] min_i, input [packet_len_width_p-1:0] mask_i, input [15:0] rand_i);
     len_gen = min_i + (packet_len_width_p'(rand_i) & mask_i);
   endfunction
-  // random valid-byte count for the last beat: 1..keep_width from LFSR high bits
+  // random valid-byte count for the last beat: 1..keep_width from LFSR high bits.
+  // Keep is MSB-aligned (top nbytes lanes valid, lane 0 empty) to match RIFL's
+  // partial-beat convention -- RIFL reserves lane 0 of the frame for the length
+  // code, so a right-justified (standard-AXI, low-lanes-valid) keep would leave
+  // lane 0 valid, RIFL would treat every partial beat as full, drop the length,
+  // and the RX width converter would desync.  See commit message.
   function automatic [keep_width_lp-1:0] tkeep_from_lfsr(input [15:0] rand_i);
     int nbytes; logic [keep_width_lp-1:0] m;
     begin
       nbytes = (rand_i[15:11] % keep_width_lp) + 1;   // 1..32
       m = '0;
-      for (int b = 0; b < keep_width_lp; b++) m[b] = (b < nbytes);
+      for (int b = 0; b < keep_width_lp; b++) m[b] = (b >= keep_width_lp - nbytes);
       tkeep_from_lfsr = m;
     end
   endfunction

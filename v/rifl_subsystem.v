@@ -339,6 +339,35 @@ module rifl_subsystem
     wire [RX_OCC_W-1:0]   tkeep_occ_usr;
     wire [DESC_OCC_W-1:0] tx_desc_usr;
     wire [DESC_OCC_W-1:0] rx_pkt_usr;
+    // ---- PRBS BIST: config CDC into rifl_usr_clk, generator/checker, TX/RX mux ----
+    wire prbs_en_sync, prbs_clr_sync, prbs_perturb_sync;
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_en_cdc (
+       .dest_out(prbs_en_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_enable_all[i]));
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_clr_cdc (
+       .dest_out(prbs_clr_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_clear));
+    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_ptb_cdc (
+       .dest_out(prbs_perturb_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_seed_perturb[i]));
+    // quasi-static config bus (written before enable): {min[15:0], mask[15:0], seed[31:0]}
+    wire [63:0] prbs_cfg_sync;
+    xpm_cdc_array_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0), .WIDTH(64)) prbs_cfg_cdc (
+       .dest_out(prbs_cfg_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0)
+      ,.src_in({prbs_min_len, prbs_len_mask, prbs_seed}));
+
+    wire [axis_data_width_p-1:0]  fifo_tx_tdata, bist_tx_tdata;
+    wire [axis_keep_width_lp-1:0] bist_tx_tkeep;
+    wire fifo_tx_tlast, fifo_tx_tvalid, fifo_tx_tready;
+    wire bist_tx_tlast, bist_tx_tvalid, bist_tx_tready;
+    wire prbs_tx_active;                               // BIST generator running or draining
+    // TX owned by the generator while enabled OR while it finishes the current
+    // packet after a disable -- keeps the link on the generator through the
+    // graceful drain so no partial frame is left on the wire.
+    wire prbs_tx_sel = prbs_en_sync | prbs_tx_active;
+    wire fifo_rx_tready, bist_rx_tready;
+    wire fifo_rx_tvalid = m_axis_tvalid_gty_o[i] & ~prbs_en_sync;
+    wire [axis_data_width_p-1:0] bist_err_tdata;
+    wire bist_err_tvalid, bist_err_tready;
+    wire [ERR_OCC_W-1:0] err_occ_usr;
+    wire [31:0] bist_err_count;
     rifl_txrx_fifo #(
        .AXI_DATA_WIDTH(axis_data_width_p)
       ,.AXI_ADDR_WIDTH(32)
@@ -407,35 +436,6 @@ module rifl_subsystem
       ,.err_s_axis_tready(bist_err_tready)
       ,.err_count_o      (err_occ_usr    )
     );
-    // ---- PRBS BIST: config CDC into rifl_usr_clk, generator/checker, TX/RX mux ----
-    wire prbs_en_sync, prbs_clr_sync, prbs_perturb_sync;
-    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_en_cdc (
-       .dest_out(prbs_en_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_enable_all[i]));
-    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_clr_cdc (
-       .dest_out(prbs_clr_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_clear));
-    xpm_cdc_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0)) prbs_ptb_cdc (
-       .dest_out(prbs_perturb_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0), .src_in(prbs_seed_perturb[i]));
-    // quasi-static config bus (written before enable): {min[15:0], mask[15:0], seed[31:0]}
-    wire [63:0] prbs_cfg_sync;
-    xpm_cdc_array_single #(.DEST_SYNC_FF(4), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0), .WIDTH(64)) prbs_cfg_cdc (
-       .dest_out(prbs_cfg_sync), .dest_clk(rifl_usr_clks[i]), .src_clk(1'b0)
-      ,.src_in({prbs_min_len, prbs_len_mask, prbs_seed}));
-
-    wire [axis_data_width_p-1:0]  fifo_tx_tdata, bist_tx_tdata;
-    wire [axis_keep_width_lp-1:0] bist_tx_tkeep;
-    wire fifo_tx_tlast, fifo_tx_tvalid, fifo_tx_tready;
-    wire bist_tx_tlast, bist_tx_tvalid, bist_tx_tready;
-    wire prbs_tx_active;                               // BIST generator running or draining
-    // TX owned by the generator while enabled OR while it finishes the current
-    // packet after a disable -- keeps the link on the generator through the
-    // graceful drain so no partial frame is left on the wire.
-    wire prbs_tx_sel = prbs_en_sync | prbs_tx_active;
-    wire fifo_rx_tready, bist_rx_tready;
-    wire fifo_rx_tvalid = m_axis_tvalid_gty_o[i] & ~prbs_en_sync;
-    wire [axis_data_width_p-1:0] bist_err_tdata;
-    wire bist_err_tvalid, bist_err_tready;
-    wire [ERR_OCC_W-1:0] err_occ_usr;
-    wire [31:0] bist_err_count;
 
     rifl_prbs_bist #(
        .data_width_p(axis_data_width_p)
