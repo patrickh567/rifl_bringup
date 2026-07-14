@@ -43,6 +43,7 @@ module rifl_tx #
     input logic pause_req,
     input logic retrans_req,
     input logic compensate,
+    input logic comp_ready,
     //flow control
     input logic local_fc,
     input logic remote_fc,

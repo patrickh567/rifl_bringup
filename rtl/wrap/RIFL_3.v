@@ -35,7 +35,10 @@ module RIFL_3 (
   rx_retrans_request,
   local_fc,
   remote_fc,
-  compensate
+  compensate,
+  comp_locked,
+  comp_type,
+  rx_fifo_overflow
 );
 
 (* X_INTERFACE_INFO = "xilinx.com:interface:diff_clock:1.0 gt_ref CLK_P" *)
@@ -114,6 +117,9 @@ output wire [3 : 0] local_fc;
 output wire [3 : 0] remote_fc;
 (* X_INTERFACE_INFO = "clarkshen.com:user:rifl_stat:1.0 rifl_stat compensate" *)
 output wire compensate;
+  output wire comp_locked;
+  output wire [1:0] comp_type;
+  output wire [3:0] rx_fifo_overflow;
 
   RIFL #(
     .N_CHANNEL(4),
@@ -162,6 +168,9 @@ output wire compensate;
     .rx_retrans_request(rx_retrans_request),
     .local_fc(local_fc),
     .remote_fc(remote_fc),
-    .compensate(compensate)
+    .compensate(compensate),
+    .comp_locked(comp_locked),
+    .comp_type(comp_type),
+    .rx_fifo_overflow(rx_fifo_overflow)
   );
 endmodule

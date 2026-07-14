@@ -58,6 +58,7 @@ module rifl_core #
     input logic [CNT_WIDTH-1:0] clk_cnt,
 //control
     input logic compensate,
+    input logic comp_ready,
 //stats
     //tx
     output logic [2:0] tx_state[N_CHANNEL-1:0],
@@ -70,7 +71,9 @@ module rifl_core #
     output logic [N_CHANNEL-1:0] rx_retrans_request,
     //flow control
     output logic [N_CHANNEL-1:0] local_fc,
-    output logic [N_CHANNEL-1:0] remote_fc
+    output logic [N_CHANNEL-1:0] remote_fc,
+    //rx async-FIFO overflow (sticky, per channel)
+    output logic [N_CHANNEL-1:0] rx_fifo_overflow
 );
 //tx
     logic [PAYLOAD_WIDTH-1:0] tx_lane_tdata[N_CHANNEL-1:0];
@@ -134,6 +137,7 @@ module rifl_core #
             .pause_req        (rx_pause_request[i]),
             .retrans_req      (rx_retrans_request[i]),
             .compensate       (compensate),
+            .comp_ready       (comp_ready),
             .tx_state         (tx_state[i]),
             .local_fc         (local_fc[i]),
             .remote_fc        (remote_fc[i])
@@ -171,7 +175,8 @@ module rifl_core #
             .pause_req      (rx_pause_request[i]),
             .retrans_req    (rx_retrans_request[i]),
             .local_fc       (local_fc[i]),
-            .remote_fc      (remote_fc[i])
+            .remote_fc      (remote_fc[i]),
+            .rx_async_fifo_overflow (rx_fifo_overflow[i])
         );
     end
 

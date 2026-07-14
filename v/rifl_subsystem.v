@@ -221,6 +221,9 @@ module rifl_subsystem
   logic [num_gty_port_p-1:0][gt_serial_width_p-1:0] rifl_local_fc_o             ;
   logic [num_gty_port_p-1:0][gt_serial_width_p-1:0] rifl_remote_fc_o            ;
   logic [num_gty_port_p-1:0]                        rifl_compensate_o           ;
+  logic [num_gty_port_p-1:0]                        rifl_comp_locked_o          ;
+  logic [num_gty_port_p-1:0][1:0]                   rifl_comp_type_o            ;
+  logic [num_gty_port_p-1:0][gt_serial_width_p-1:0] rifl_rx_fifo_ovf_o          ;
 
   wire [num_gty_port_p-1:0][11:0] gt_loopback_in = {num_gty_port_p{12'b000000000000}};
 
@@ -288,6 +291,9 @@ module rifl_subsystem
     ,.local_fc             (rifl_local_fc_o             [``idx``])                                  \
     ,.remote_fc            (rifl_remote_fc_o            [``idx``])                                  \
     ,.compensate           (rifl_compensate_o           [``idx``])                                  \
+    ,.comp_locked          (rifl_comp_locked_o          [``idx``])                                  \
+    ,.comp_type            (rifl_comp_type_o            [``idx``])                                  \
+    ,.rx_fifo_overflow     (rifl_rx_fifo_ovf_o          [``idx``])                                  \
   );
 
   `RIFL_MACRO(0)
@@ -664,6 +670,22 @@ module rifl_subsystem
     ,.src_in  (rifl_status_raw)
   );
 
+  // rx async-FIFO overflow: sticky level in the rx_gt_clk domain -> sync to init_clk.
+  // (comp_locked / comp_type are already init_clk -- no CDC, direct-connected below.)
+  wire [num_gty_port_p-1:0][gt_serial_width_p-1:0] rifl_rx_fifo_ovf_sync;
+  xpm_cdc_array_single #(
+     .DEST_SYNC_FF  (4)
+    ,.INIT_SYNC_FF  (0)
+    ,.SIM_ASSERT_CHK(0)
+    ,.SRC_INPUT_REG (0)
+    ,.WIDTH         (num_gty_port_p*gt_serial_width_p)
+  ) rx_fifo_ovf_cdc (
+     .dest_out(rifl_rx_fifo_ovf_sync)
+    ,.dest_clk(init_clk)
+    ,.src_clk (1'b0)
+    ,.src_in  (rifl_rx_fifo_ovf_o)
+  );
+
   // Full status bus = level status + per-event {sticky,count} + RX occupancies.
   //   [14..93] per-channel event counters (rx_error, rx_pause, rx_retrans,
   //            tx_send_pause, tx_send_retrans; index = base + link*4 + channel)
@@ -671,7 +693,8 @@ module rifl_subsystem
   //   [106..109] tx_desc_occupancy (packets buffered)   [110..113] rx_pkt_count (packets received)
   //   [114..117] prbs_error_count (corrupted packets)   [118..121] prbs_errfifo_occupancy
   localparam int EVT_PER_SIG    = num_gty_port_p*gt_serial_width_p;
-  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 7*num_gty_port_p; // 122
+  //   [122..125] comp_locked   [126..129] comp_type   [130..133] rx_async_fifo_overflow
+  localparam int CSR_NUM_STATUS = CSR_LVL_STATUS + 5*EVT_PER_SIG + 10*num_gty_port_p; // 134
 
   wire [CSR_NUM_STATUS-1:0][31:0] status_all;
   assign status_all[CSR_LVL_STATUS-1:0] = rifl_status_sync;
@@ -690,6 +713,9 @@ module rifl_subsystem
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 4*num_gty_port_p + i] = rx_pkt_st[i];    // 110+i
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 5*num_gty_port_p + i] = prbs_err_st[i];  // 114+i
     assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 6*num_gty_port_p + i] = prbs_occ_st[i];  // 118+i
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 7*num_gty_port_p + i] = 32'(rifl_comp_locked_o[i]);    // 122+i -> 0x228 (init_clk, no CDC)
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 8*num_gty_port_p + i] = 32'(rifl_comp_type_o[i]);      // 126+i -> 0x238 (init_clk, no CDC)
+    assign status_all[CSR_LVL_STATUS + 5*EVT_PER_SIG + 9*num_gty_port_p + i] = 32'(rifl_rx_fifo_ovf_sync[i]); // 130+i -> 0x248 (synced)
   end
 
   // ---------------------------------------------------------------------------

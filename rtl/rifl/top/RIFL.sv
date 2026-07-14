@@ -72,7 +72,12 @@ module RIFL #
     //flow control
     output logic [N_CHANNEL-1:0] local_fc,
     output logic [N_CHANNEL-1:0] remote_fc,
-    output logic compensate
+    output logic compensate,
+//status: comp lock + 2-bit sign (single per link, from clock_compensate via .*) and
+//rx async-FIFO overflow (sticky, per channel, from rifl_core/rifl_rx)
+    output logic comp_locked,
+    output logic [1:0] comp_type,
+    output logic [N_CHANNEL-1:0] rx_fifo_overflow
 );
     localparam int CRC_WIDTH = 12;
     localparam int CRC_POLY = 12'h02f;
@@ -160,6 +165,7 @@ module RIFL #
     logic [CHANNEL_PER_GRP-1:0] rx_up_core[N_BOUNDING_GRP-1:0];
     logic [CHANNEL_PER_GRP-1:0] rx_aligned_core[N_BOUNDING_GRP-1:0];
     logic [CHANNEL_PER_GRP-1:0] rx_error_core[N_BOUNDING_GRP-1:0];
+    logic [CHANNEL_PER_GRP-1:0] rx_fifo_overflow_core[N_BOUNDING_GRP-1:0];
     logic [CHANNEL_PER_GRP-1:0] rx_pause_request_core[N_BOUNDING_GRP-1:0];
     logic [CHANNEL_PER_GRP-1:0] rx_retrans_request_core[N_BOUNDING_GRP-1:0];
     logic [CHANNEL_PER_GRP-1:0] local_fc_core[N_BOUNDING_GRP-1:0];
@@ -181,6 +187,9 @@ module RIFL #
 
 //compensate
     logic clock_active;
+    logic comp_ready;              // comp ready-gate (tx_frame_clk); binds to u_clock_compensate via .*
+    logic far_end_up;              // far-end link-up (= &rx_up); re-arm source, binds via .*
+    assign far_end_up = &rx_up;
 
     genvar i,j;
     rifl_rst_gen u_rifl_rst_gen(.*);
@@ -387,6 +396,7 @@ module RIFL #
             .gt_tx_data            (gt_tx_data_core[i]    ),
             .clk_cnt               (frame_clk_cnt         ),
             .compensate            (compensate            ),
+            .comp_ready            (comp_ready            ),
             .tx_state              (tx_state_core[i]      ),
             .rx_up                 (rx_up_core[i]         ),
             .rx_aligned_tx         (rx_aligned_tx_core[i] ),
@@ -395,7 +405,8 @@ module RIFL #
             .rx_pause_request      (rx_pause_request_core[i]),
             .rx_retrans_request    (rx_retrans_request_core[i]),
             .local_fc              (local_fc_core[i]),
-            .remote_fc             (remote_fc_core[i])
+            .remote_fc             (remote_fc_core[i]),
+            .rx_fifo_overflow      (rx_fifo_overflow_core[i])
         );
     end
 
@@ -468,6 +479,7 @@ module RIFL #
             assign rx_aligned_rx[i*CHANNEL_PER_GRP+j] = rx_aligned_rx_core[i][j];
             assign rx_up[i*CHANNEL_PER_GRP+j] = rx_up_core[i][j];
             assign rx_error[i*CHANNEL_PER_GRP+j] = rx_error_core[i][j];
+            assign rx_fifo_overflow[i*CHANNEL_PER_GRP+j] = rx_fifo_overflow_core[i][j];
             assign rx_pause_request[i*CHANNEL_PER_GRP+j] = rx_pause_request_core[i][j];
             assign rx_retrans_request[i*CHANNEL_PER_GRP+j] = rx_retrans_request_core[i][j];
             assign local_fc[i*CHANNEL_PER_GRP+j] = local_fc_core[i][j];

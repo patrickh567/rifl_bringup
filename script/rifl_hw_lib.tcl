@@ -50,6 +50,9 @@ set ::RIFL_ST_TXDESC_BASE 0x1E8
 set ::RIFL_ST_RXPKT_BASE  0x1F8
 set ::RIFL_ST_PRBS_ERR_BASE 0x208    ;# per-link PRBS corrupted-packet count
 set ::RIFL_ST_PRBS_OCC_BASE 0x218    ;# per-link PRBS error-record FIFO occupancy (256b words)
+set ::RIFL_ST_COMP_LOCKED   0x228    ;# per-link comp sign resolved (1 = locked out of UNKNOWN)
+set ::RIFL_ST_COMP_TYPE     0x238    ;# per-link comp sign (0=UNKNOWN 1=YES/tx-fast 2=NO/rx-fast)
+set ::RIFL_ST_RX_FIFO_OVF   0x248    ;# per-link rx async-FIFO overflow (sticky; per-channel nibble)
 
 # PRBS BIST control registers
 set ::RIFL_CTRL1          0x04       ;# [3:0] per-link enable, [8] clear, [19:16] per-link seed-perturb
@@ -219,6 +222,9 @@ proc rifl_rx_pkt_occ  {link} { return [rifl_rd [expr {$::RIFL_ST_RXPKT_BASE  + 4
 # ---- PRBS BIST (built-in self-test generator/checker) ----
 proc rifl_prbs_err_cnt {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_ERR_BASE + 4*$link}]] }
 proc rifl_prbs_occ     {link} { return [rifl_rd [expr {$::RIFL_ST_PRBS_OCC_BASE + 4*$link}]] }
+proc rifl_comp_locked  {link} { return [rifl_rd [expr {$::RIFL_ST_COMP_LOCKED   + 4*$link}]] }
+proc rifl_comp_type    {link} { return [rifl_rd [expr {$::RIFL_ST_COMP_TYPE     + 4*$link}]] }
+proc rifl_rx_fifo_ovf  {link} { return [rifl_rd [expr {$::RIFL_ST_RX_FIFO_OVF   + 4*$link}]] }
 # Configure the generators/checkers (write BEFORE enabling): seed, max length,
 # min length.  Length = min + (lfsr & mask); the mask is the smallest 2^k-1 that
 # covers (max-min), so a non-power-of-two max is rounded UP to a power-of-two

@@ -48,7 +48,9 @@ module rifl_rx #
     output logic retrans_req,
     //flow control
     output logic local_fc,
-    output logic remote_fc
+    output logic remote_fc,
+//async-FIFO overflow (sticky ppm-drop indicator, observe-only)
+    output logic rx_async_fifo_overflow
 );
     localparam int BUFFER_DEPTH = 1 << (FRAME_ID_WIDTH+1);
     localparam int PAUSE_ON_VAL = 2*BUFFER_DEPTH/3;
@@ -82,6 +84,9 @@ module rifl_rx #
 
 //debug
     logic s_ready;
+//async-FIFO overflow detect (observe the otherwise-open write-side ready)
+    logic afifo_tready;
+    logic afifo_overflow;
 
     rx_aligner #(
         .DWIDTH        (GT_WIDTH),
@@ -148,11 +153,23 @@ module rifl_rx #
         .m_axis_aclk   (tx_gt_clk),
         .s_axis_tdata  ({crc_good,sof_descrambler,descrambled_data}),
         .s_axis_tvalid (isdata),
-        .s_axis_tready (),
+        .s_axis_tready (afifo_tready),
         .m_axis_tdata  (dwidth_conv_in),
         .m_axis_tvalid (dwidth_conv_in_vld),
         .m_axis_tready (1'b1)
     );
+
+    // Sticky async-FIFO overflow.  This FIFO has NO write-side flow control
+    // (s_axis_tready was left open), so a write while full drops a beat -- the
+    // ppm-overflow failure mode on the 2<->3 pair.  OBSERVE (do not gate) the
+    // ready and latch the drop for software; cleared on rx link reset.
+    always_ff @(posedge rx_gt_clk) begin
+        if (rx_frame_rst)
+            afifo_overflow <= 1'b0;
+        else if (isdata & ~afifo_tready)
+            afifo_overflow <= 1'b1;
+    end
+    assign rx_async_fifo_overflow = afifo_overflow;
 
     remote_fc_detector #(
         .DWIDTH      (GT_WIDTH),
