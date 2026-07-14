@@ -66,6 +66,56 @@ set_property -name "file_type" -value "SystemVerilog" -objects \
      "*v/axi_lite_regs.v" "*v/event_capture_cdc.v" "*v/axi_jtag_master.v" \
      "*v/rifl_axi_clock_converters.v" "*v/rifl_prbs_bist.sv" "*v/rifl_subsystem.v" "*v/top_rifl.v"]]
 
+# ============================================================================
+# De-IP RIFL: replace the 4 RIFL XCI cores with pure IN-CONTEXT RTL source.
+#
+# The base vu47p_project.tcl (sourced above) added RIFL_0..3.xci; remove them and
+# add the RIFL source directly to sources_1 so it synthesizes together with the
+# top (no out-of-context / blockset machinery).  Added once:
+#   * fabric SystemVerilog  (rtl/rifl, rtl/cdc, rtl/easy_fifo, rtl/utils)
+#   * gtwizard GT Verilog   (rtl/gt : 25 generic + per-quad x4)
+#   * the 4 thin RIFL_N wrappers (rtl/wrap/RIFL_0..3.v), each = RIFL #(.GT_QUAD(N)),
+#     which u_rifl_subsystem instantiates as RIFL_inst_0..3.
+#
+# Constraints (applied at TOP synth/impl, scoped to the RIFL / gt_core refs):
+#   * RIFL_syn.xdc      : fabric false_path/multicycle, used_in_synthesis, SCOPED_TO_REF RIFL
+#   * RIFL_impl.xdc     : adds the -hold companions, used_in_implementation, SCOPED_TO_REF RIFL
+#   * gt_core_<QUAD>.xdc: GTYE4 channel LOC + pwrgood, SCOPED_TO_REF gt_core_<QUAD>
+# Top-level clocks/refclk pins + the init/core<->usr async live in xdc/impl.tcl.
+# (RIFL_ooc.xdc / the per-unit RIFL_N_impl.xdc copies were OOC-only and are unused.)
+# ============================================================================
+foreach _x {RIFL_0 RIFL_1 RIFL_2 RIFL_3} {
+  remove_files -quiet [get_files -quiet ${_x}.xci]
+}
+
+# Fabric SV + GT Verilog + the 4 RIFL_N wrappers -> sources_1 (in-context).
+set _rifl_sv   [split [string trim [exec find ${origin_dir}/rtl -name {*.sv}]] "\n"]
+set _rifl_gt   [split [string trim [exec find ${origin_dir}/rtl/gt -name {*.v}]] "\n"]
+set _rifl_wrap [split [string trim [exec find ${origin_dir}/rtl/wrap -name {*.v}]] "\n"]
+add_files -norecurse -fileset [get_filesets sources_1] $_rifl_sv
+set_property file_type SystemVerilog [get_files $_rifl_sv]
+add_files -norecurse -fileset [get_filesets sources_1] $_rifl_gt
+set_property file_type Verilog [get_files $_rifl_gt]
+add_files -norecurse -fileset [get_filesets sources_1] $_rifl_wrap
+set_property file_type Verilog [get_files $_rifl_wrap]
+
+# Fabric timing (scoped to the RIFL core): setup-only at synth, +hold at impl.
+add_files -norecurse -fileset [get_filesets constrs_1] ${origin_dir}/xdc/rifl/RIFL_syn.xdc
+set_property SCOPED_TO_REF RIFL           [get_files RIFL_syn.xdc]
+set_property used_in_synthesis     true   [get_files RIFL_syn.xdc]
+set_property used_in_implementation false [get_files RIFL_syn.xdc]
+add_files -norecurse -fileset [get_filesets constrs_1] ${origin_dir}/xdc/rifl/RIFL_impl.xdc
+set_property SCOPED_TO_REF RIFL           [get_files RIFL_impl.xdc]
+set_property used_in_synthesis     false  [get_files RIFL_impl.xdc]
+set_property used_in_implementation true   [get_files RIFL_impl.xdc]
+
+# Per-quad GT channel LOC placement (scoped to each gt_core_<QUAD> module).
+foreach _q {X0Y28 X0Y36 X0Y44 X1Y20} {
+  add_files -norecurse -fileset [get_filesets constrs_1] ${origin_dir}/xdc/rifl/gt_core_${_q}.xdc
+  set_property SCOPED_TO_REF gt_core_${_q} [get_files gt_core_${_q}.xdc]
+}
+update_compile_order -fileset sources_1
+
 set_property top top_rifl [get_filesets sources_1]
 set_property top top_rifl [get_filesets sim_1]
 

@@ -7,9 +7,10 @@
 #      shared seed.  Each link's checker regenerates its peer's sequence, so a
 #      healthy link should report ZERO errors.  Read each link's error count and
 #      error-record FIFO fill.
-#   3. forced error: perturb link 0's checker seed so it expects a different
-#      sequence than its peer actually sends -> link 0's error count must climb
-#      and its error FIFO must capture records.  Read back one record.
+#   3. forced error: inject bit errors at link 0's GENERATOR (TX-side force_error).
+#      Its corrupted stream is received by the cabled PARTNER (link 1), whose
+#      checker must flag errors -> link 1's error count climbs and its error FIFO
+#      captures records.  Read back one record.
 #
 # The point of step 3 is to prove the checker + error buffer actually work
 # (RIFL's own error-injection is compiled out of this image).
@@ -48,14 +49,17 @@ for {set L 0} {$L < 4} {incr L} {
 }
 rifl_prbs_enable 0x0
 
-# ---- forced error: perturb link 0's checker; expect its count to climb ----
-puts "=== forced error: perturb link 0's checker (expect link 0 err > 0) ==="
+# ---- forced error: inject at link 0's GENERATOR (TX-side).  force_error flips a
+# ---- data bit in link 0's TRANSMITTED PRBS, so the error is caught by the cabled
+# ---- PARTNER (link 1) checker -- read link 1, not link 0.
+set partner 1
+puts "=== forced error: inject at link 0 generator (expect PARTNER link $partner err > 0) ==="
 rifl_prbs_enable 0xF 0x1
 after 1000
-set e0 [rifl_prbs_err_cnt 0]; set o0 [rifl_prbs_occ 0]
-puts [format "  link 0 : prbs_err=%d  errfifo_occ=%d" $e0 $o0]
-if {$o0 >= 3} {
-  set rec [rifl_prbs_err_rec 0]
+set ep [rifl_prbs_err_cnt $partner]; set op [rifl_prbs_occ $partner]
+puts [format "  link %d (partner) : prbs_err=%d  errfifo_occ=%d" $partner $ep $op]
+if {$op >= 3} {
+  set rec [rifl_prbs_err_rec $partner]
   puts "  first error record (3 x 256-bit words, raw hex):"
   puts "    A = [string range $rec 0 63]"
   puts "    B = [string range $rec 64 127]"
@@ -65,7 +69,7 @@ if {$o0 >= 3} {
 }
 rifl_prbs_enable 0x0
 
-puts [format "=== RESULT: healthy total err=%d (want 0);  link0 forced err=%d (want >0) ===" $toterr $e0]
+puts [format "=== RESULT: healthy total err=%d (want 0);  link0-inject -> link%d err=%d (want >0) ===" $toterr $partner $ep]
 rifl_status
 rifl_disconnect
 puts "=== done ==="

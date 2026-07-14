@@ -9,6 +9,7 @@
 vivado*
 hs_err*
 webtalk*
+usage_statistics_webtalk.*
 .Xil
 xsim.dir
 *.jou

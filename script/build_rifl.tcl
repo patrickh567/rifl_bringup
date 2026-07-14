@@ -30,7 +30,14 @@ if {[llength [get_files -quiet *rifl_prbs_bist.sv]] == 0} {
 }
 update_compile_order -fileset sources_1
 
-# ---- synthesis ----
+# ---- top synthesis ----
+# RIFL is de-IP'd as in-context RTL (fabric + GT + the 4 RIFL_N wrappers live in
+# sources_1), so synth_1 builds it together with the top -- no separate OOC runs.
+# Lever 1 (timing): enable global retiming to rebalance the 5-7 level ~390 MHz
+# datapath and recover part of the source-vs-prebuilt-dcp gap.  Keep the default
+# 'rebuilt' flatten so the scoped RIFL / gt_core_<QUAD> constraints still resolve
+# (a full-flatten directive like PerformanceOptimized would dissolve the gt_core ref).
+set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
 reset_run synth_1
 launch_runs synth_1 -jobs $jobs
 wait_on_run synth_1
@@ -41,9 +48,14 @@ puts "INFO: synthesis complete."
 
 # ---- implementation -> bitstream ----
 # Performance_ExplorePostRoutePhysOpt (explore place/route + post-route phys-opt).
-# The aggressive AggressiveExplore/ExtraTimingOpt overrides were tried and made
-# the ~390 MHz usr clock worse (-0.369 vs -0.215), so use the base strategy.
+# NOTE: AggressiveExplore/ExtraTimingOpt as the whole place+route STRATEGY was tried
+# and made the ~390 MHz usr clock worse (-0.369 vs -0.215).  Instead keep the base
+# Explore place/route and only strengthen the POST-ROUTE phys-opt STEP (lever 3):
+# phys-opt is greedy-improving, so replication+placement here pulls the
+# route-dominated ~390 MHz nets together without disturbing the good place/route.
 set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
 reset_run impl_1
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs
 wait_on_run impl_1

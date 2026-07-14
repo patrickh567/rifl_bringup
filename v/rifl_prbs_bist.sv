@@ -2,28 +2,50 @@
 `default_nettype none
 
 // -----------------------------------------------------------------------------
-// rifl_prbs_bist : per-link PRBS packet generator + self-checking receiver.
+// rifl_prbs_bist : per-link PRBS BER generator + SELF-SYNCHRONIZING checker.
 //
-// When enabled, the transmit side emits back-to-back packets of pseudo-random
-// data (maximal-length PRBS-31, 256 bits/beat), of random length, with a random
-// number of valid bytes in the last beat (its tkeep).  The receive side
-// regenerates the identical expected stream (same seed) and compares data,
-// packet length, and tkeep for every beat; a packet that mismatches anywhere is
-// counted and (if the error buffer has room) a compact record of the first
-// divergence is emitted as three 256-bit beats for software to read.
+// (IBERT-style rewrite.)  The transmit side streams a continuous maximal-length
+// PRBS-31 (x^31 + x^28 + 1), 256 bits/beat, in full beats (tkeep all-ones),
+// chopped into fixed-size RIFL frames only so the link has periodic TLASTs.  The
+// data is byte-continuous across frames.
 //
-// Timing (this is the ~390 MHz link clock, 2.56 ns):
-//   * Packet length is min + (lfsr & mask) -- a software-supplied power-of-two
-//     mask -- so the length path is an AND + add (no range/mask arithmetic).
-//   * The checker's compare is PIPELINED: the lightweight expected model (PRBS +
-//     length counters) runs single-cycle; the heavy path (256-bit XOR/mask ->
-//     grouped OR -> 16->1 reduce -> flag/record/count) is split across three
-//     pipeline registers, so error logging lands a few cycles later (identical).
-//   * The generator's combinational data output is registered by a skid buffer in
-//     the subsystem before it reaches the link.
+// The receive side does NOT regenerate the sequence from a seed.  It exploits the
+// fact that every PRBS-31 output bit obeys a fixed recurrence:
 //
-// Disable is graceful: the generator finishes the current packet (its TLAST)
-// before releasing the link, so no partial frame is left on the wire.
+//     o[n] = o[n-28] ^ o[n-31]
+//
+// so the checker simply tests, for every received bit, whether it equals the XOR
+// of the two received bits 28 and 31 positions back:
+//
+//     err[n] = r[n] ^ r[n-28] ^ r[n-31]      (0 for on-sequence data)
+//
+// This depends ONLY on received bits, so there is no phase/seed/packet-index to
+// align -- the checker is self-synchronizing.  A startup slip, a dropped or
+// duplicated beat, or a whole missed packet costs only a short error burst; the
+// check re-locks by itself within one beat (31 bits) as its 31-bit history refills
+// with post-event data.  It structurally cannot have the "off-by-one-beat forever"
+// desync of a predict-from-seed checker.
+//
+// Notes:
+//  * Error multiplication: a single received bit error trips the recurrence at
+//    positions n, n+28, n+31 -> ~3 flagged violations per real bit error.  We count
+//    errored BEATS (a beat with >=1 violation); 0 = clean.  Divide-by-3 is only
+//    relevant if software later popcounts the per-beat violation vectors.
+//  * All-zeros blind spot: an all-zeros stream trivially satisfies the recurrence.
+//    A live PRBS is never all-zeros; a DEAD link (constant 0) would falsely read 0.
+//    Rely on RIFL link-up + a real stream flowing (and see recv_beat_count_o > 0).
+//  * force_error_i injects a single flipped data bit periodically at the generator
+//    to prove the checker + error FIFO (replaces the old seed-perturb self-test).
+//    Its three recurrence violations land in one beat, so error_count climbs by +1
+//    per injection (do NOT divide error_count by 3); the first injection is delayed
+//    past the checker settle window so the count starts moving promptly.
+//
+// Timing (~390 MHz link clock, 2.56 ns): err[k] is a 3-input XOR per bit (shallow);
+// the 256->1 reduce is pipelined p1 (register) -> p2 (grouped 16-bit OR) -> p3
+// (16->1) -> stage 3 (count + record), same structure as before.
+//
+// Disable is graceful: the generator finishes the current frame (its TLAST) before
+// releasing the link, so no partial frame is left on the wire.
 // -----------------------------------------------------------------------------
 module rifl_prbs_bist
   #(parameter integer data_width_p       = 256
@@ -32,6 +54,8 @@ module rifl_prbs_bist
    ,localparam integer keep_width_lp     = data_width_p/8   // 32
    ,localparam integer prbs_width_lp     = 31
    ,localparam integer rec_width_lp      = 3*data_width_p   // 768-bit error record
+   ,localparam integer default_frame_lp  = 64               // beats/frame if cfg is 0
+   ,localparam integer prime_beats_lp    = 32               // checker settle after enable
    )
   (input  wire clk_i
   ,input  wire reset_i                                       // active-high (usr reset)
@@ -39,10 +63,10 @@ module rifl_prbs_bist
   // ---- configuration (CDC-synced + quasi-static; captured on the enable edge) ----
   ,input  wire                          prbs_enable_i        // per-link enable + arm (level)
   ,input  wire                          clear_i              // clear counters + error buffer
-  ,input  wire [packet_len_width_p-1:0] cfg_len_mask_i       // length randomness mask (2^k-1)
-  ,input  wire [packet_len_width_p-1:0] cfg_pkt_len_min_i    // min length (beats); len = min + (lfsr & mask)
-  ,input  wire [31:0]                   cfg_seed_i           // PRBS + length seed
-  ,input  wire                          seed_perturb_i       // perturb the CHECKER seed (forced-error test)
+  ,input  wire [packet_len_width_p-1:0] cfg_len_mask_i       // unused (kept for interface compat)
+  ,input  wire [packet_len_width_p-1:0] cfg_pkt_len_min_i    // frame size in beats (0 -> default)
+  ,input  wire [31:0]                   cfg_seed_i           // PRBS seed (generator)
+  ,input  wire                          force_error_i        // inject generator bit errors (self-test)
 
   // ---- TX AXIS toward the RIFL link (mux-selected in the subsystem) ----
   ,output logic [data_width_p-1:0]      tx_tdata_o
@@ -54,17 +78,18 @@ module rifl_prbs_bist
 
   // ---- RX AXIS from the RIFL link (tapped in the subsystem) ----
   ,input  wire [data_width_p-1:0]       rx_tdata_i
-  ,input  wire [keep_width_lp-1:0]      rx_tkeep_i
-  ,input  wire                          rx_tlast_i
+  ,input  wire [keep_width_lp-1:0]      rx_tkeep_i           // unused (full-beat stream)
+  ,input  wire                          rx_tlast_i           // unused for the data check
   ,input  wire                          rx_tvalid_i
   ,output wire                          rx_tready_o
 
   // ---- status ----
-  ,output logic [counter_width_p-1:0]   error_count_o        // corrupted packets (saturating)
-  ,output logic [counter_width_p-1:0]   sent_packet_count_o
-  ,output logic [counter_width_p-1:0]   recv_packet_count_o
+  ,output logic [counter_width_p-1:0]   error_count_o        // errored beats (saturating); 0 = clean
+  ,output logic [counter_width_p-1:0]   sent_packet_count_o  // frames sent
+  ,output logic [counter_width_p-1:0]   recv_packet_count_o  // beats checked
 
   // ---- compact error record -> error FIFO (3 x 256-bit beats per record) ----
+  //   beat0 = received data, beat1 = violation vector (which bits broke), beat2 = {beat index}
   ,output logic [data_width_p-1:0]      err_axis_tdata_o
   ,output logic                         err_axis_tlast_o     // last (3rd) beat of a record
   ,output logic                         err_axis_tvalid_o
@@ -74,6 +99,7 @@ module rifl_prbs_bist
   // ---------------------------------------------------------------------------
   // Parallel PRBS-31 (x^31 + x^28 + 1): advance 256 steps, emit 256 bits.
   // Returns {next_state[30:0], data[255:0]}.  Shallow XOR matrix (~2 LUT levels).
+  // bits[k] is sequence position (beat_start + k); bits[0] is the earliest.
   // ---------------------------------------------------------------------------
   function automatic [prbs_width_lp+data_width_p-1:0] prbs_step(input [prbs_width_lp-1:0] s_in);
     logic [prbs_width_lp-1:0] s;
@@ -90,333 +116,199 @@ module rifl_prbs_bist
     end
   endfunction
 
-  function automatic [prbs_width_lp-1:0] prbs_seed(input [31:0] seed_i, input perturb_i);
+  function automatic [prbs_width_lp-1:0] prbs_seed(input [31:0] seed_i);
     logic [prbs_width_lp-1:0] s;
     begin
-      s = seed_i[prbs_width_lp-1:0] ^ (perturb_i ? prbs_width_lp'(31'h2AAA_AAAA) : '0);
-      prbs_seed = (s == '0) ? prbs_width_lp'(1) : s;
+      s = seed_i[prbs_width_lp-1:0];
+      prbs_seed = (s == '0) ? prbs_width_lp'(1) : s;   // never the forbidden all-zero state
     end
   endfunction
 
   // ---------------------------------------------------------------------------
-  // Length + tkeep helpers.  Length LFSR: 16-bit Fibonacci, one step per packet.
-  // Length itself is just min + (lfsr & mask) -- a power-of-two range.
-  // ---------------------------------------------------------------------------
-  function automatic [15:0] lfsr_seed(input [31:0] seed_i);
-    logic [15:0] s;
-    begin s = seed_i[15:0] ^ seed_i[31:16] ^ 16'hace1; lfsr_seed = (s == 16'h0) ? 16'h1 : s; end
-  endfunction
-  function automatic [15:0] lfsr16_next(input [15:0] state_i);
-    // x^16 + x^14 + x^13 + x^11 + 1
-    lfsr16_next = {state_i[14:0], state_i[15] ^ state_i[13] ^ state_i[12] ^ state_i[10]};
-  endfunction
-  function automatic [packet_len_width_p-1:0] len_gen
-    (input [packet_len_width_p-1:0] min_i, input [packet_len_width_p-1:0] mask_i, input [15:0] rand_i);
-    len_gen = min_i + (packet_len_width_p'(rand_i) & mask_i);
-  endfunction
-  // random valid-byte count for the last beat: 1..keep_width from LFSR high bits.
-  // Keep is MSB-aligned (top nbytes lanes valid, lane 0 empty) to match RIFL's
-  // partial-beat convention -- RIFL reserves lane 0 of the frame for the length
-  // code, so a right-justified (standard-AXI, low-lanes-valid) keep would leave
-  // lane 0 valid, RIFL would treat every partial beat as full, drop the length,
-  // and the RX width converter would desync.  See commit message.
-  function automatic [keep_width_lp-1:0] tkeep_from_lfsr(input [15:0] rand_i);
-    int nbytes; logic [keep_width_lp-1:0] m;
-    begin
-      nbytes = (rand_i[15:11] % keep_width_lp) + 1;   // 1..32
-      m = '0;
-      for (int b = 0; b < keep_width_lp; b++) m[b] = (b >= keep_width_lp - nbytes);
-      tkeep_from_lfsr = m;
-    end
-  endfunction
-  // byte-replicate a tkeep mask to data width for a masked data compare
-  function automatic [data_width_p-1:0] keep_to_bits(input [keep_width_lp-1:0] k_i);
-    logic [data_width_p-1:0] b;
-    begin for (int j = 0; j < keep_width_lp; j++) b[j*8 +: 8] = {8{k_i[j]}}; keep_to_bits = b; end
-  endfunction
-
-  // ---------------------------------------------------------------------------
-  // Registered (quasi-static) config: min length and length mask.  Registering
-  // them keeps the config -> length arithmetic off the timed length path.
+  // Enable-edge detect + quasi-static frame length.
   // ---------------------------------------------------------------------------
   logic enable_r;
   wire  enable_pulse = prbs_enable_i & ~enable_r;
-  logic [packet_len_width_p-1:0] cfg_min_r, cfg_mask_r;
+  logic [packet_len_width_p-1:0] frame_len_r;
 
   always_ff @(posedge clk_i) begin
     if (reset_i) begin
-      enable_r   <= 1'b0;
-      cfg_min_r  <= packet_len_width_p'(1);
-      cfg_mask_r <= '0;
+      enable_r    <= 1'b0;
+      frame_len_r <= packet_len_width_p'(default_frame_lp);
     end else begin
-      enable_r   <= prbs_enable_i;
-      cfg_min_r  <= (cfg_pkt_len_min_i == '0) ? packet_len_width_p'(1) : cfg_pkt_len_min_i;
-      cfg_mask_r <= cfg_len_mask_i;
+      enable_r    <= prbs_enable_i;
+      frame_len_r <= (cfg_pkt_len_min_i < packet_len_width_p'(2))
+                       ? packet_len_width_p'(default_frame_lp) : cfg_pkt_len_min_i;
     end
   end
 
   // ---------------------------------------------------------------------------
-  // TX generator.
+  // TX generator: continuous PRBS, full beats, TLAST every frame_len_r beats.
   // ---------------------------------------------------------------------------
   logic [prbs_width_lp-1:0]      tx_prbs_r;
-  logic [15:0]                   tx_lfsr_r;          // length LFSR state for the CURRENT packet
-  logic [packet_len_width_p-1:0] tx_cur_len_r;
-  logic [keep_width_lp-1:0]      tx_cur_keep_r;
-  logic [packet_len_width_p-1:0] tx_flit_idx_r;
+  logic [packet_len_width_p-1:0] tx_frame_cnt_r;
+  logic [7:0]                    tx_inj_cnt_r;      // error-injection spacing (every 256 beats)
   logic                          tx_run_r;
 
-  assign tx_active_o = tx_run_r;                     // running or draining the final packet
+  assign tx_active_o = tx_run_r;
 
   wire [prbs_width_lp-1:0] tx_prbs_next;
   wire [data_width_p-1:0]  tx_prbs_data;
   assign {tx_prbs_next, tx_prbs_data} = prbs_step(tx_prbs_r);
 
-  wire tx_hs   = tx_tvalid_o & tx_tready_i;
-  wire tx_last = (tx_flit_idx_r == (tx_cur_len_r - packet_len_width_p'(1)));
+  wire tx_hs         = tx_tvalid_o & tx_tready_i;
+  wire tx_frame_last = (tx_frame_cnt_r == frame_len_r - packet_len_width_p'(1));
+  wire tx_inject     = force_error_i & (tx_inj_cnt_r == 8'd0);   // flip bit 0 periodically
 
   always_comb begin
     tx_tvalid_o = tx_run_r;
-    tx_tdata_o  = tx_prbs_data;
-    tx_tlast_o  = tx_last;
-    tx_tkeep_o  = tx_last ? tx_cur_keep_r : '1;
+    tx_tdata_o  = tx_inject ? (tx_prbs_data ^ {{(data_width_p-1){1'b0}}, 1'b1}) : tx_prbs_data;
+    tx_tkeep_o  = '1;                                          // always full beats
+    tx_tlast_o  = tx_frame_last;
   end
 
   always_ff @(posedge clk_i) begin
     if (reset_i | clear_i) begin
       tx_run_r <= 1'b0;
     end else if (enable_pulse) begin
-      logic [15:0] lseed;
-      lseed          = lfsr_seed(cfg_seed_i);
       tx_run_r       <= 1'b1;
-      tx_prbs_r      <= prbs_seed(cfg_seed_i, 1'b0);   // TX always sends the canonical sequence
-      tx_lfsr_r      <= lseed;
-      tx_cur_len_r   <= len_gen(cfg_min_r, cfg_mask_r, lseed);
-      tx_cur_keep_r  <= tkeep_from_lfsr(lseed);
-      tx_flit_idx_r  <= '0;
+      tx_prbs_r      <= prbs_seed(cfg_seed_i);
+      tx_frame_cnt_r <= '0;
+      tx_inj_cnt_r   <= 8'd128;   // first injected error lands well after the RX settle window
     end else if (tx_run_r & tx_hs) begin
-      tx_prbs_r <= tx_prbs_next;                       // advance data PRBS per beat
-      if (tx_last) begin
-        // Packet boundary.  On a pending disable, stop HERE (graceful); otherwise
-        // roll to the next packet (advance the length LFSR).
-        if (~prbs_enable_i) begin
-          tx_run_r <= 1'b0;
-        end else begin
-          logic [15:0] ln;
-          ln            = lfsr16_next(tx_lfsr_r);
-          tx_flit_idx_r <= '0;
-          tx_lfsr_r     <= ln;
-          tx_cur_len_r  <= len_gen(cfg_min_r, cfg_mask_r, ln);
-          tx_cur_keep_r <= tkeep_from_lfsr(ln);
-        end
+      tx_prbs_r    <= tx_prbs_next;                            // advance one beat (clean sequence)
+      tx_inj_cnt_r <= tx_inj_cnt_r + 8'd1;
+      if (tx_frame_last) begin
+        tx_frame_cnt_r <= '0;
+        if (~prbs_enable_i) tx_run_r <= 1'b0;                  // graceful stop at a frame boundary
       end else begin
-        tx_flit_idx_r <= tx_flit_idx_r + packet_len_width_p'(1);
+        tx_frame_cnt_r <= tx_frame_cnt_r + packet_len_width_p'(1);
       end
     end
   end
 
   // ---------------------------------------------------------------------------
-  // RX expected model (single-cycle): regenerate the expected data/length/tkeep,
-  // advancing the PRBS per received beat and the length LFSR per received packet.
+  // RX self-synchronizing checker.
+  //   history = previous beat's top 31 bits (sequence positions 225..255).
+  //   err[k]  = r[k] ^ tap28(k) ^ tap31(k)
+  //     tap28(k) = (k>=28) ? r[k-28] : hist[k+3]       // n-28 lands in prev beat for k<28
+  //     tap31(k) = (k>=31) ? r[k-31] : hist[k]         // n-31 lands in prev beat for k<31
+  // hist[j] holds prev-beat bit 225+j (hist[0]=prev[225], hist[30]=prev[255]).
   // ---------------------------------------------------------------------------
-  logic [prbs_width_lp-1:0]      rx_prbs_r;
-  logic [15:0]                   rx_lfsr_r;
-  logic [packet_len_width_p-1:0] rx_cur_len_r;
-  logic [keep_width_lp-1:0]      rx_cur_keep_r;
-  logic [packet_len_width_p-1:0] rx_flit_idx_r;
-  logic [counter_width_p-1:0]    rx_pkt_idx_r;
-  logic                          rx_run_r;
+  logic [prbs_width_lp-1:0] hist_r;                            // prev beat bits [255:225]
+  logic [7:0]               prime_r;                           // settle countdown after enable
+  logic                     rx_run_r;
 
   assign rx_tready_o = rx_run_r;
+  wire   rx_hs       = rx_tvalid_i & rx_tready_o;
+  wire   rx_check    = rx_run_r & rx_hs & (prime_r == 8'd0);   // count only past the settle window
 
-  wire [prbs_width_lp-1:0] rx_prbs_next;
-  wire [data_width_p-1:0]  rx_exp_data;
-  assign {rx_prbs_next, rx_exp_data} = prbs_step(rx_prbs_r);
+  wire [data_width_p-1:0] rx_err_vec;
+  for (genvar gk = 0; gk < data_width_p; gk++) begin: recur
+    wire tap28 = (gk >= 28) ? rx_tdata_i[gk-28] : hist_r[gk+3];
+    wire tap31 = (gk >= 31) ? rx_tdata_i[gk-31] : hist_r[gk];
+    assign rx_err_vec[gk] = rx_tdata_i[gk] ^ tap28 ^ tap31;
+  end
 
-  wire rx_hs       = rx_tvalid_i & rx_tready_o;
-  wire rx_exp_last = (rx_flit_idx_r == (rx_cur_len_r - packet_len_width_p'(1)));
-  wire [keep_width_lp-1:0] rx_exp_keep = rx_exp_last ? rx_cur_keep_r : '1;
-
-  // ---------------------------------------------------------------------------
-  // Compare pipeline (kept shallow for the ~390 MHz clock).
-  //   p1 : model output registered (expected + received + metadata).
-  //   p2 : masked XOR -> grouped 16-bit OR + length/tkeep mismatch flags.
-  //   p3 : 16->1 reduce to a single data-mismatch bit + forward.
-  //   stage 3 : flag, per-packet accumulate, count + record.
-  // ---------------------------------------------------------------------------
+  // ---- compare pipeline (kept shallow) ----
   logic                       p1_valid;
-  logic [data_width_p-1:0]    p1_exp_data, p1_rcv_data;
-  logic [keep_width_lp-1:0]   p1_exp_keep, p1_rcv_keep;
-  logic                       p1_exp_last, p1_rcv_last;
-  logic [counter_width_p-1:0] p1_pkt_idx;
-  logic [31:0]                p1_flit_idx;
+  logic [data_width_p-1:0]    p1_err_vec, p1_rcv_data;
+  logic [counter_width_p-1:0] p1_beat_idx;
 
   logic                       p2_valid;
-  logic [data_width_p/16-1:0] p2_partial;   // grouped-OR of the masked XOR (16 bits/group)
-  logic [data_width_p-1:0]    p2_exp_data, p2_rcv_data;
-  logic [keep_width_lp-1:0]   p2_exp_keep, p2_rcv_keep;
-  logic                       p2_exp_last, p2_rcv_last, p2_last_mm, p2_tkeep_mm;
-  logic [counter_width_p-1:0] p2_pkt_idx;
-  logic [31:0]                p2_flit_idx;
+  logic [data_width_p/16-1:0] p2_partial;                      // grouped-OR of the violation vector
+  logic [data_width_p-1:0]    p2_err_vec, p2_rcv_data;
+  logic [counter_width_p-1:0] p2_beat_idx;
 
-  logic                       p3_valid, p3_data_mm, p3_last_mm, p3_tkeep_mm;
-  logic [data_width_p-1:0]    p3_exp_data, p3_rcv_data;
-  logic [keep_width_lp-1:0]   p3_exp_keep, p3_rcv_keep;
-  logic                       p3_exp_last, p3_rcv_last;
-  logic [counter_width_p-1:0] p3_pkt_idx;
-  logic [31:0]                p3_flit_idx;
+  logic                       p3_valid, p3_has_err;
+  logic [data_width_p-1:0]    p3_err_vec, p3_rcv_data;
+  logic [counter_width_p-1:0] p3_beat_idx;
 
-  // masked byte-wise difference (registered as a grouped-OR into p2, then reduced
-  // in stage 2 -- keeps both stages shallow instead of one deep 256->1 reduce).
-  wire [data_width_p-1:0] p1_masked = (p1_exp_data ^ p1_rcv_data) & keep_to_bits(p1_exp_keep);
+  // ---- error record (built directly from the p3-stage errored beat) ----
+  wire  [data_width_p-1:0]    q_meta = { {(data_width_p-counter_width_p){1'b0}}, p3_beat_idx };
 
-  // stage-3 decode of p3 (the 16->1 reduce is registered into p3_data_mm)
-  wire        s3_flit_err = p3_valid & (p3_data_mm | p3_last_mm | p3_tkeep_mm);
-  wire [7:0]  s3_flags    = {p3_exp_last, p3_rcv_last, 2'b00, p3_tkeep_mm, p3_last_mm, p3_data_mm, 1'b0};
-
-  logic                       pkt_err_r;             // this packet mismatched somewhere (stage 2)
-  logic [counter_width_p-1:0] rec_pkt_idx_r;
-  logic [31:0]                rec_flit_idx_r;
-  logic [data_width_p-1:0]    rec_exp_data_r, rec_rcv_data_r;
-  logic [keep_width_lp-1:0]   rec_exp_keep_r, rec_rcv_keep_r;
-  logic [7:0]                 rec_flags_r;
-
-  // record content: latched first-divergence fields, or -- when the first error
-  // is on this very (last) beat -- the current stage-3 beat's fields.
-  wire                       pkt_err_now = pkt_err_r | s3_flit_err;
-  wire [counter_width_p-1:0] q_pkt_idx   = pkt_err_r ? rec_pkt_idx_r  : p3_pkt_idx;
-  wire [31:0]                q_flit_idx  = pkt_err_r ? rec_flit_idx_r : p3_flit_idx;
-  wire [data_width_p-1:0]    q_exp_data  = pkt_err_r ? rec_exp_data_r : p3_exp_data;
-  wire [data_width_p-1:0]    q_rcv_data  = pkt_err_r ? rec_rcv_data_r : p3_rcv_data;
-  wire [keep_width_lp-1:0]   q_exp_keep  = pkt_err_r ? rec_exp_keep_r : p3_exp_keep;
-  wire [keep_width_lp-1:0]   q_rcv_keep  = pkt_err_r ? rec_rcv_keep_r : p3_rcv_keep;
-  wire [7:0]                 q_flags     = pkt_err_r ? rec_flags_r    : s3_flags;
-  wire [data_width_p-1:0]    q_beat2 =
-       { {(data_width_p-136){1'b0}}, q_flags, q_rcv_keep, q_exp_keep, q_flit_idx, q_pkt_idx };
-
-  // ---- error-record emit FSM: 3 x 256-bit beats ----
   logic                    emit_busy_r;
   logic [1:0]              emit_cnt_r;
   logic [rec_width_lp-1:0] emit_rec_r;
-  wire  emit_hs = err_axis_tvalid_o & err_axis_tready_i;
+  wire  emit_hs  = err_axis_tvalid_o & err_axis_tready_i;
+  wire  push_now = p3_valid & p3_has_err & ~emit_busy_r;
   assign err_axis_tvalid_o = emit_busy_r;
   assign err_axis_tdata_o  = emit_rec_r[emit_cnt_r*data_width_p +: data_width_p];
   assign err_axis_tlast_o  = (emit_cnt_r == 2'd2);
 
-  // push a record on the (stage-3) packet boundary if it mismatched and the emitter is free
-  wire push_now = p3_valid & p3_rcv_last & pkt_err_now & ~emit_busy_r;
-
   always_ff @(posedge clk_i) begin
     if (reset_i | clear_i) begin
       rx_run_r            <= 1'b0;
-      rx_prbs_r           <= prbs_width_lp'(1);
-      rx_lfsr_r           <= 16'h1;
-      rx_cur_len_r        <= packet_len_width_p'(1);
-      rx_cur_keep_r       <= '1;
-      rx_flit_idx_r       <= '0;
-      rx_pkt_idx_r        <= '0;
+      hist_r              <= '0;
+      prime_r             <= 8'(prime_beats_lp);
       p1_valid            <= 1'b0;
       p2_valid            <= 1'b0;
       p3_valid            <= 1'b0;
-      pkt_err_r           <= 1'b0;
       error_count_o       <= '0;
       sent_packet_count_o <= '0;
       recv_packet_count_o <= '0;
       emit_busy_r         <= 1'b0;
       emit_cnt_r          <= 2'd0;
     end else begin
-      // TX packet counter (mirror of the TX FSM's boundary)
-      if (tx_hs & tx_last & tx_run_r & (sent_packet_count_o != '1))
-        sent_packet_count_o <= sent_packet_count_o + counter_width_p'(1);
+      if (~prbs_enable_i) rx_run_r <= 1'b0;                    // abrupt RX stop; pipeline drains via valids
 
       if (enable_pulse) begin
-        logic [15:0] lseed;
-        lseed               = lfsr_seed(cfg_seed_i);
         rx_run_r            <= 1'b1;
-        rx_prbs_r           <= prbs_seed(cfg_seed_i, seed_perturb_i);  // perturb -> forced errors
-        rx_lfsr_r           <= lseed;
-        rx_cur_len_r        <= len_gen(cfg_min_r, cfg_mask_r, lseed);
-        rx_cur_keep_r       <= tkeep_from_lfsr(lseed);
-        rx_flit_idx_r       <= '0;
-        rx_pkt_idx_r        <= '0;
+        hist_r              <= '0;
+        prime_r             <= 8'(prime_beats_lp);             // settle: fill history + skip startup transient
         p1_valid            <= 1'b0;
         p2_valid            <= 1'b0;
         p3_valid            <= 1'b0;
-        pkt_err_r           <= 1'b0;
         error_count_o       <= '0;
         recv_packet_count_o <= '0;
         sent_packet_count_o <= '0;
         emit_busy_r         <= 1'b0;
         emit_cnt_r          <= 2'd0;
       end else begin
-        if (~prbs_enable_i) rx_run_r <= 1'b0;           // abrupt RX stop; pipeline drains via valids
+        // frames sent (mirror of the TX FSM boundary)
+        if (tx_run_r & tx_hs & tx_frame_last & (sent_packet_count_o != '1))
+          sent_packet_count_o <= sent_packet_count_o + counter_width_p'(1);
 
-        // ---- expected model: advance per received beat/packet ----
+        // history + settle advance every received beat
         if (rx_run_r & rx_hs) begin
-          rx_prbs_r <= rx_prbs_next;
-          if (rx_tlast_i) begin
-            logic [15:0] ln;
-            ln            = lfsr16_next(rx_lfsr_r);
-            rx_flit_idx_r <= '0;
-            rx_pkt_idx_r  <= rx_pkt_idx_r + counter_width_p'(1);
-            rx_lfsr_r     <= ln;
-            rx_cur_len_r  <= len_gen(cfg_min_r, cfg_mask_r, ln);
-            rx_cur_keep_r <= tkeep_from_lfsr(ln);
-          end else begin
-            rx_flit_idx_r <= rx_flit_idx_r + packet_len_width_p'(1);
-          end
+          hist_r <= rx_tdata_i[data_width_p-1 -: prbs_width_lp];   // top 31 bits [255:225]
+          if (prime_r != 8'd0) prime_r <= prime_r - 8'd1;
         end
 
-        // ---- pipeline stage p1: register model output + received beat ----
-        p1_valid <= rx_run_r & rx_hs;
-        if (rx_run_r & rx_hs) begin
-          p1_exp_data <= rx_exp_data;   p1_rcv_data <= rx_tdata_i;
-          p1_exp_keep <= rx_exp_keep;   p1_rcv_keep <= rx_tkeep_i;
-          p1_exp_last <= rx_exp_last;   p1_rcv_last <= rx_tlast_i;
-          p1_pkt_idx  <= rx_pkt_idx_r;  p1_flit_idx <= 32'(rx_flit_idx_r);
+        // ---- stage p1: register the violation vector + received beat (only once settled) ----
+        p1_valid <= rx_check;
+        if (rx_check) begin
+          p1_err_vec  <= rx_err_vec;
+          p1_rcv_data <= rx_tdata_i;
+          p1_beat_idx <= recv_packet_count_o;
+          if (recv_packet_count_o != '1) recv_packet_count_o <= recv_packet_count_o + counter_width_p'(1);
         end
 
-        // ---- pipeline stage p2: masked XOR -> grouped 16-bit OR + mismatch flags ----
+        // ---- stage p2: grouped 16-bit OR ----
         p2_valid <= p1_valid;
         if (p1_valid) begin
-          for (int g = 0; g < data_width_p/16; g++) p2_partial[g] <= |p1_masked[g*16 +: 16];
-          p2_last_mm  <= (p1_rcv_last != p1_exp_last);
-          p2_tkeep_mm <= (p1_rcv_keep != p1_exp_keep);
-          p2_exp_data <= p1_exp_data;   p2_rcv_data <= p1_rcv_data;
-          p2_exp_keep <= p1_exp_keep;   p2_rcv_keep <= p1_rcv_keep;
-          p2_exp_last <= p1_exp_last;   p2_rcv_last <= p1_rcv_last;
-          p2_pkt_idx  <= p1_pkt_idx;    p2_flit_idx <= p1_flit_idx;
+          for (int g = 0; g < data_width_p/16; g++) p2_partial[g] <= |p1_err_vec[g*16 +: 16];
+          p2_err_vec  <= p1_err_vec;
+          p2_rcv_data <= p1_rcv_data;
+          p2_beat_idx <= p1_beat_idx;
         end
 
-        // ---- pipeline stage p3: 16->1 reduce to a single data-mismatch bit ----
+        // ---- stage p3: 16 -> 1 reduce ----
         p3_valid <= p2_valid;
         if (p2_valid) begin
-          p3_data_mm  <= |p2_partial;
-          p3_last_mm  <= p2_last_mm;     p3_tkeep_mm <= p2_tkeep_mm;
-          p3_exp_data <= p2_exp_data;    p3_rcv_data <= p2_rcv_data;
-          p3_exp_keep <= p2_exp_keep;    p3_rcv_keep <= p2_rcv_keep;
-          p3_exp_last <= p2_exp_last;    p3_rcv_last <= p2_rcv_last;
-          p3_pkt_idx  <= p2_pkt_idx;     p3_flit_idx <= p2_flit_idx;
+          p3_has_err  <= |p2_partial;
+          p3_err_vec  <= p2_err_vec;
+          p3_rcv_data <= p2_rcv_data;
+          p3_beat_idx <= p2_beat_idx;
         end
 
-        // ---- stage 3: flag, accumulate, count + record ----
-        if (p3_valid) begin
-          if (s3_flit_err & ~pkt_err_r) begin           // latch the first divergence
-            rec_pkt_idx_r  <= p3_pkt_idx;  rec_flit_idx_r <= p3_flit_idx;
-            rec_exp_data_r <= p3_exp_data; rec_rcv_data_r <= p3_rcv_data;
-            rec_exp_keep_r <= p3_exp_keep; rec_rcv_keep_r <= p3_rcv_keep;
-            rec_flags_r    <= s3_flags;
-            pkt_err_r      <= 1'b1;
-          end
-          if (p3_rcv_last) begin                         // packet boundary in stage 3
-            if (pkt_err_now & (error_count_o != '1)) error_count_o <= error_count_o + counter_width_p'(1);
-            if (recv_packet_count_o != '1)            recv_packet_count_o <= recv_packet_count_o + counter_width_p'(1);
-            pkt_err_r <= 1'b0;
-          end
-        end
+        // ---- stage 3: count errored beats + capture a record ----
+        if (p3_valid & p3_has_err & (error_count_o != '1))
+          error_count_o <= error_count_o + counter_width_p'(1);
 
-        // ---- error-record emitter ----
+        // ---- error-record emitter: push each errored beat while the emitter is free ----
         if (push_now) begin
-          emit_rec_r  <= {q_beat2, q_rcv_data, q_exp_data};
+          emit_rec_r  <= {q_meta, p3_err_vec, p3_rcv_data};
           emit_busy_r <= 1'b1;
           emit_cnt_r  <= 2'd0;
         end else if (emit_busy_r & emit_hs) begin
@@ -426,6 +318,9 @@ module rifl_prbs_bist
       end
     end
   end
+
+  // tie off genuinely-unused inputs to keep lint quiet (kept for interface compatibility)
+  wire _unused = &{1'b0, cfg_len_mask_i, rx_tkeep_i, rx_tlast_i};
 
 endmodule
 

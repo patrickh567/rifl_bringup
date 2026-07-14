@@ -446,7 +446,7 @@ module rifl_subsystem
       ,.prbs_enable_i(prbs_en_sync), .clear_i(prbs_clr_sync)
       ,.cfg_len_mask_i(prbs_cfg_sync[47:32])
       ,.cfg_pkt_len_min_i(prbs_cfg_sync[63:48]), .cfg_seed_i(prbs_cfg_sync[31:0])
-      ,.seed_perturb_i(prbs_perturb_sync)
+      ,.force_error_i(prbs_perturb_sync)
       ,.tx_tdata_o(bist_tx_tdata), .tx_tkeep_o(bist_tx_tkeep)
       ,.tx_tlast_o(bist_tx_tlast), .tx_tvalid_o(bist_tx_tvalid), .tx_tready_i(bist_tx_tready)
       ,.tx_active_o(prbs_tx_active)
