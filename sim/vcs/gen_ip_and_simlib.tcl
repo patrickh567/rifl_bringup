@@ -74,7 +74,8 @@ set_property file_type SystemVerilog [get_files -of_objects [get_filesets sim_1]
 set_property top     tb_rifl_subsystem [get_filesets sim_1]
 set_property top_lib xil_defaultlib    [get_filesets sim_1]
 
-set need_ips [get_ips -quiet {clk_wiz_0 RIFL_0 RIFL_1 RIFL_2 RIFL_3}]
+# RIFL_0..3 were de-IP'd to in-context rtl/ (commit 1292f74); clk_wiz_0 is the only IP left.
+set need_ips [get_ips -quiet {clk_wiz_0}]
 puts "INFO: generating simulation targets for: $need_ips"
 generate_target {simulation} $need_ips
 catch { export_ip_user_files -of_objects $need_ips -no_script -sync -force -quiet }

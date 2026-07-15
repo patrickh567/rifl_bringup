@@ -47,6 +47,10 @@ module tb_rifl_subsystem;
   localparam logic [31:0] PRBS_MIN      = 32'h0000_0010;        // [17:2] min length (beats)
   localparam logic [31:0] STAT_PRBSERR0 = 32'h0000_0040 + 32'd114*4; // reg 114 per-link corrupted-packet count
   localparam logic [31:0] STAT_PRBSOCC0 = 32'h0000_0040 + 32'd118*4; // reg 118 per-link error-record FIFO occupancy
+  // ---- part (b): new clock-comp / RX-overflow status regs (commit 77e63a4) ----
+  localparam logic [31:0] STAT_COMP_LOCK0 = 32'h0000_0040 + 32'd122*4; // reg 122+i comp_locked (telemetry)
+  localparam logic [31:0] STAT_COMP_TYPE0 = 32'h0000_0040 + 32'd126*4; // reg 126+i comp_type  (ppm sign, telemetry)
+  localparam logic [31:0] STAT_RXOVF0     = 32'h0000_0040 + 32'd130*4; // reg 130+i rx async-FIFO overflow (sticky)
 
   // ---- input clocks ----
   logic ext_refclk_p = 1'b0;        // 200 MHz LVDS -> firmware_bd MMCM
@@ -67,6 +71,18 @@ module tb_rifl_subsystem;
     localparam int peer = g ^ 1;
     assign gt_rxp[g*gt_serial_width_p +: gt_serial_width_p] = gt_txp[peer*gt_serial_width_p +: gt_serial_width_p];
     assign gt_rxn[g*gt_serial_width_p +: gt_serial_width_p] = gt_txn[peer*gt_serial_width_p +: gt_serial_width_p];
+  end
+
+  // ---- part (b) item 1: idle-insertion cadence probe on link 0's clock_compensate.
+  // The fixed-rate comp asserts `compensate` 1 cycle per 2^10=1024 tx_frame_clk cycles
+  // (COMP_PERIOD_LOG2=10).  Count assertions vs cycles over a window while cad_run is set.
+  // Hierarchy: dut -> RIFL_inst_0 (`RIFL_MACRO(0)) -> inst (RIFL) -> u_clock_compensate.
+  logic   cad_run = 1'b0;
+  longint cad_cyc = 0, cad_hi = 0;
+  int     ovf_ns  = 0;    // +OVF_NS>0 activates the item-4 overflow-escalation injection (bind, end of file)
+  always @(posedge dut.RIFL_inst_0.inst.u_clock_compensate.tx_frame_clk) if (cad_run) begin
+    cad_cyc = cad_cyc + 1;
+    if (dut.RIFL_inst_0.inst.u_clock_compensate.compensate) cad_hi = cad_hi + 1;
   end
 
   wire                      init_clk;
@@ -277,6 +293,7 @@ module tb_rifl_subsystem;
     if (!$value$plusargs("PRBS_US=%d",     prbs_us))     prbs_us     = 0;
     if (!$value$plusargs("PRBS_MAXLEN=%d", prbs_maxlen)) prbs_maxlen = 64;
     if (!$value$plusargs("PRBS_SEED=%h",   prbs_seed))   prbs_seed   = 32'hDEAD_BEEF;
+    if (!$value$plusargs("OVF_NS=%d",      ovf_ns))      ovf_ns      = 0;   // item-4 overflow demo (link 0)
     if (prbs_maxlen < 1) prbs_maxlen = 1;
 
     // wait for init_clk (firmware_bd MMCM) to start toggling
@@ -333,27 +350,76 @@ module tb_rifl_subsystem;
       lite_wr(REG_CTRL1, 32'h0000_000F);
       $display("[%0t] PRBS enabled on all 4 links (seed=0x%08x, lengths 1..%0d beats); soaking %0d us ...",
                $time, prbs_seed, prbs_maxlen, prbs_us);
+      cad_run = 1'b1;                                            // (b) item 1: measure comp cadence during soak
       #(prbs_us * 1_000_000);                                    // <-- the long PRBS sequence
+      cad_run = 1'b0;
       lite_wr(REG_CTRL1, 32'h0000_0000);                         // graceful disable
       repeat (500) @(posedge init_clk);
       // healthy result: every link's corrupted-packet count must be 0
       for (i = 0; i < num_gty_port_p; i++) begin
         lite_rd(STAT_PRBSERR0 + i*4, rdw);
         lite_rd(STAT_PRBSOCC0 + i*4, occ_rdw);
-        $display("[%0t] link %0d: prbs_err=%0d errfifo_occ=%0d  %s", $time, i, rdw, occ_rdw, (rdw==0)?"OK":"<-- ERRORS");
-        if (rdw !== 32'd0) errors++;
+        $display("[%0t] link %0d: prbs_err=%0d errfifo_occ=%0d  %s", $time, i, rdw, occ_rdw,
+                 (rdw==0)?"OK":((ovf_ns>0 && i==0)?"(expected: item-4 overflow injection)":"<-- ERRORS"));
+        if (rdw !== 32'd0 && !(ovf_ns > 0 && i == 0)) errors++;   // link 0 errors are the injected item-4 fault
       end
-      // liveness sanity: perturb link 0's checker -> its error count must climb
-      lite_wr(REG_CTRL1, 32'h0001_0000);                         // perturb link 0, enable low
+      // ===== part (b): clock-comp + RX-overflow verification (commit 77e63a4) =====
+      // item 2 (transparency): the soak ran with fixed-rate idle insertion ACTIVE
+      //   (compensate ~1/1024 frames) yet every link is 0 errors -> insertions do not
+      //   corrupt the stream; confirm the elastic buffer never overflowed.
+      // item 5 (telemetry): read per-link comp_locked / comp_type / overflow CSRs.  The
+      //   comp measurement needs ~84 ms to resolve (bench-only), so comp_type stays
+      //   UNKNOWN(0) / comp_locked=0 in a short sim -- the datapath does not depend on it.
+      $display("[%0t] (b) clock-comp + overflow telemetry (post-soak):", $time);
+      for (i = 0; i < num_gty_port_p; i++) begin
+        logic [31:0] cl, ct, ov;
+        lite_rd(STAT_COMP_LOCK0 + i*4, cl);
+        lite_rd(STAT_COMP_TYPE0 + i*4, ct);
+        lite_rd(STAT_RXOVF0     + i*4, ov);
+        $display("[%0t]   link %0d: comp_locked=%0d comp_type=%0d rx_async_fifo_overflow=0x%02x %s",
+                 $time, i, cl[0], ct[1:0], ov[7:0], (ov===32'd0)?"(no overflow)":"<-- OVERFLOW");
+        if (ov !== 32'd0) begin
+          if (ovf_ns > 0 && i == 0)
+            $display("[%0t]   -> (b) item4: link 0 overflow ESCALATION CONFIRMED (sticky 0x%02x) -- the forced write-while-full drop, previously silent, is now flagged and escalated to rx_error/retransmit", $time, ov[7:0]);
+          else begin errors++; $error("[%0t] link %0d RX elastic-buffer OVERFLOW on a clean link", $time, i); end
+        end
+      end
+      // item 4 recovery: after the forced overflow the link must survive via retransmit --
+      // confirm all links still up, then a cleared re-soak has 0 new errors (checker re-locked).
+      if (ovf_ns > 0) begin
+        lite_rd(STAT_RX_UP, rdw);
+        $display("[%0t] (b) item4 recovery: rx_up=0x%04x after overflow %s", $time, rdw[15:0], (rdw[15:0]==16'hffff)?"(all links still up)":"<-- A LINK DROPPED");
+        if (rdw[15:0] !== 16'hffff) begin errors++; $error("[%0t] a link dropped after overflow -- no recovery", $time); end
+        lite_wr(REG_CTRL1, 32'h0000_0100);                       // clear counts + error FIFO
+        lite_wr(REG_CTRL1, 32'h0000_000F);                       // re-enable, counters cleared
+        #(20 * 1_000_000);                                       // clean re-soak
+        lite_wr(REG_CTRL1, 32'h0000_0000);
+        repeat (500) @(posedge init_clk);
+        lite_rd(STAT_PRBSERR0, rdw);                             // link 0's checker (it took the drop)
+        $display("[%0t] (b) item4 recovery re-soak: link 0 err=%0d (expect 0 = checker re-locked after retransmit)", $time, rdw);
+        if (rdw !== 32'd0) begin errors++; $error("[%0t] checker did not re-lock after overflow recovery", $time); end
+      end
+      // item 1 (cadence): compensate should have asserted ~cad_cyc/1024 times.
+      if (cad_hi == 0)
+        $display("[%0t] (b) item1 cadence: soak too short to observe an insertion (need >~10.5us of soak); cad_cyc=%0d", $time, cad_cyc);
+      else begin
+        $display("[%0t] (b) item1 cadence: compensate fired %0d times / %0d tx_frame_clk cycles = 1 per %0d (expect ~1024)",
+                 $time, cad_hi, cad_cyc, cad_cyc/cad_hi);
+        if ((cad_cyc/cad_hi) < 900 || (cad_cyc/cad_hi) > 1200) begin errors++; $error("[%0t] comp cadence off -- expect ~1 insertion per 1024 frames", $time); end
+      end
+      // liveness sanity: inject bit errors into link 0's TX (reg1[16]=force_error).  The
+      // self-synchronizing BIST corrupts the TRANSMITTED stream, so the errors surface at
+      // the PEER link's checker (link 0 -> link 1 = link 0^1), not at link 0 itself.
+      lite_wr(REG_CTRL1, 32'h0001_0000);                         // force-error link 0, enable low
       repeat (20) @(posedge init_clk);
-      lite_wr(REG_CTRL1, 32'h0001_000F);                         // enable all + perturb link 0
+      lite_wr(REG_CTRL1, 32'h0001_000F);                         // enable all + force-error link 0
       #(20 * 1_000_000);
       lite_wr(REG_CTRL1, 32'h0000_0000);
       repeat (500) @(posedge init_clk);
-      lite_rd(STAT_PRBSERR0, rdw);
-      lite_rd(STAT_PRBSOCC0, occ_rdw);
-      $display("[%0t] forced-error link 0: prbs_err=%0d errfifo_occ=%0d (expect > 0)", $time, rdw, occ_rdw);
-      if (rdw === 32'd0) begin errors++; $error("[%0t] forced error NOT detected -- checker inactive", $time); end
+      lite_rd(STAT_PRBSERR0 + 32'd1*4, rdw);                     // PEER = link 1 sees link 0's corruption
+      lite_rd(STAT_PRBSOCC0 + 32'd1*4, occ_rdw);
+      $display("[%0t] forced-error link 0 -> peer link 1: prbs_err=%0d errfifo_occ=%0d (expect > 0)", $time, rdw, occ_rdw);
+      if (rdw === 32'd0) begin errors++; $error("[%0t] forced error NOT detected at peer link 1 -- checker inactive", $time); end
       if (errors == 0) $display("==== TB PASSED: PRBS soak %0d us, 0 errors on all 4 links; forced error caught ====", prbs_us);
       else             $display("==== TB FAILED: %0d error(s) in PRBS test ====", errors);
       $finish;
@@ -451,3 +517,35 @@ module tb_rifl_subsystem;
 endmodule
 
 `default_nettype wire
+
+// ---- part (b) item 4: overflow-escalation fault injector (bind into every rifl_rx) ----
+// With +OVF_NS=N (>0), force link 0's RX elastic-buffer write-side ready (afifo_tready)
+// low for N ns during the soak -- exactly the write-while-full fault the commit's item-4
+// verification calls for.  The bound module UPWARD-references the parent rifl_rx's
+// afifo_tready (no fragile hierarchical path needed) and self-gates to link 0 via its own
+// %m.  Expect: sticky rx_async_fifo_overflow latches (CSR 0x248), rx_error escalates to a
+// retransmit, and the link recovers -- the drop is no longer silent.  +OVF_AT_NS sets when.
+module ovf_inject(ref logic tready);   // tready is bound to the parent rifl_rx.afifo_tready (a var)
+  int ovf_ns = 0, ovf_at_ns = 50000;
+  function automatic bit has_sub(input string s, input string sub);
+    has_sub = 1'b0;
+    if (sub.len() == 0 || sub.len() > s.len()) return;
+    for (int k = 0; k + sub.len() <= s.len(); k++)
+      if (s.substr(k, k+sub.len()-1) == sub) begin has_sub = 1'b1; return; end
+  endfunction
+  initial begin
+    if (!$value$plusargs("OVF_NS=%d",    ovf_ns))    ovf_ns    = 0;
+    if (!$value$plusargs("OVF_AT_NS=%d", ovf_at_ns)) ovf_at_ns = 50000;
+    if (has_sub($sformatf("%m"), "RIFL_inst_0.")) $display("OVFPATH %m");   // path hedge
+    if (ovf_ns > 0 && has_sub($sformatf("%m"), "RIFL_inst_0.")) begin
+      #(ovf_at_ns * 1ns);
+      $display("[%0t] OVF_INJECT %m: forcing afifo_tready=0 for %0d ns (write-while-full)", $time, ovf_ns);
+      force tready = 1'b0;
+      #(ovf_ns * 1ns);
+      release tready;
+      $display("[%0t] OVF_INJECT %m: released afifo_tready", $time);
+    end
+  end
+endmodule
+
+bind rifl_rx ovf_inject u_ovf_inject(.tready(afifo_tready));
