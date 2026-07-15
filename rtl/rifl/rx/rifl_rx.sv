@@ -87,6 +87,12 @@ module rifl_rx #
 //async-FIFO overflow detect (observe the otherwise-open write-side ready)
     logic afifo_tready;
     logic afifo_overflow;
+//overflow -> bad-frame escalation: the frame checker sits UPSTREAM of this FIFO, so a
+//write-while-full drop is invisible to it -- escalate the drop into the same held
+//rx_error level so the far end retransmits the lost data (frame-id resync machinery
+//then recovers exactly as for a CRC-bad frame).
+    logic rx_error_vcode;
+    logic [5:0] ovf_err_hold;
 
     rx_aligner #(
         .DWIDTH        (GT_WIDTH),
@@ -114,7 +120,7 @@ module rifl_rx #
         .rx_up        (rx_up_rx),
         .data_in      (gt_rx_data_aligned),
         .crc_good_out (crc_good),
-        .rx_error     (rx_error_rx),
+        .rx_error     (rx_error_vcode),
         .isdata       (isdata)
     );
 
@@ -143,7 +149,9 @@ module rifl_rx #
         .retrans_req (retrans_req_rx)
     );
 
-//this buffer suppose to be never overflowed because of the clock compensation mechanism
+//ppm-crossing elastic buffer.  Protected by the far end's FIXED-RATE idle insertion
+//(one idle per 1024 frames, ~10x any real refclk mismatch), active from its first
+//transmitted frame -- so this buffer never accumulates a backlog, bring-up included.
     rifl_axis_async_fifo #(
         .DWIDTH (GT_WIDTH+2),
         .DEPTH  (32)
@@ -160,9 +168,9 @@ module rifl_rx #
     );
 
     // Sticky async-FIFO overflow.  This FIFO has NO write-side flow control
-    // (s_axis_tready was left open), so a write while full drops a beat -- the
-    // ppm-overflow failure mode on the 2<->3 pair.  OBSERVE (do not gate) the
-    // ready and latch the drop for software; cleared on rx link reset.
+    // (s_axis_tready was left open), so a write while full drops a beat.  With
+    // fixed-rate comp insertion this should never fire; it remains the software
+    // acceptance indicator.  Cleared on rx link reset.
     always_ff @(posedge rx_gt_clk) begin
         if (rx_frame_rst)
             afifo_overflow <= 1'b0;
@@ -170,6 +178,26 @@ module rifl_rx #
             afifo_overflow <= 1'b1;
     end
     assign rx_async_fifo_overflow = afifo_overflow;
+
+    // Escalate a drop into the receive-error path.  rx_error crosses to the tx
+    // domain through a plain level synchronizer, so hold the event for 64 rx_gt_clk
+    // (~164ns, ~16 tx_frame_clk edges) to guarantee capture; the far end then
+    // replays, and the checker's own frame-id rollback/resync takes over (replayed
+    // frames mismatch the expected id exactly as after a CRC-bad frame).
+    always_ff @(posedge rx_gt_clk) begin
+        if (rx_frame_rst)
+            ovf_err_hold <= '0;
+        else if (isdata & ~afifo_tready)
+            ovf_err_hold <= '1;
+        else if (|ovf_err_hold)
+            ovf_err_hold <= ovf_err_hold - 1'b1;
+    end
+    always_ff @(posedge rx_gt_clk) begin
+        if (rx_frame_rst)
+            rx_error_rx <= 1'b0;
+        else
+            rx_error_rx <= rx_error_vcode | (|ovf_err_hold);
+    end
 
     remote_fc_detector #(
         .DWIDTH      (GT_WIDTH),

@@ -35,5 +35,14 @@ set_multicycle_path -quiet -setup 4 -to [get_pins -hier -filter {NAME =~ *rx_err
 set_multicycle_path -quiet -setup -start 4 -from $usr_clk -to $tx_frame_clk
 set_multicycle_path -quiet -setup -end 4 -from $tx_frame_clk -to $usr_clk
 
-#compensate buffer
-set_max_delay -from [filter [all_fanout -from $init_clk_src -flat -endpoints_only] {IS_LEAF}] -through [get_pins -of_obj [get_cells -hier * -filter {NAME=~*mbc_int_reg*}] -filter {DIRECTION==OUT}] $frame_period -datapath_only
+#gray-coded CDC buses: bound the inter-bit arrival skew to < one source clock period so
+#at most one bit is in transition at any destination sampling edge (the gray-coherency
+#requirement).  The blanket false_path on the synchronizer first stages above
+#intentionally leaves per-bit latency unconstrained; bus-skew is an independent check
+#that the false_path does not override.
+#  - clock-compensation telemetry counters (tx/rx frame clk -> init_clk)
+set_bus_skew -quiet -from [get_pins -hier -filter {NAME =~ *tx_cntr/gray_reg[*]/C}] -to [get_pins -hier -filter {NAME =~ *sync_tx_cntr/d_meta_reg[0][*]/D}] $frame_period
+set_bus_skew -quiet -from [get_pins -hier -filter {NAME =~ *rx_cntr/gray_reg[*]/C}] -to [get_pins -hier -filter {NAME =~ *sync_rx_cntr/d_meta_reg[0][*]/D}] $frame_period
+#  - async-FIFO gray read/write pointers (both directions, ~390MHz GT clocks)
+set_bus_skew -quiet -from [get_pins -hier -filter {NAME =~ *u_async_wr_ctrl/u_graycntr/gray_reg[*]/C}] -to [get_pins -hier -filter {NAME =~ *u_sync_signle_bit1/d_meta_reg[0][*]/D}] $gt_period
+set_bus_skew -quiet -from [get_pins -hier -filter {NAME =~ *u_async_rd_ctrl/u_graycntr/gray_reg[*]/C}] -to [get_pins -hier -filter {NAME =~ *u_sync_signle_bit2/d_meta_reg[0][*]/D}] $gt_period

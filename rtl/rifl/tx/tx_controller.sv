@@ -25,7 +25,6 @@ module tx_controller # (
     input logic pause_req,
     input logic retrans_req,
     input logic compensate,
-    input logic comp_ready,
     //flow control
     input logic local_fc,
     input logic remote_fc,
@@ -204,8 +203,7 @@ module tx_controller # (
     assign rifl_tx_ready = state == NORMAL &&
                             ~(local_fc ^ local_fc_on) &&
                            rollback_counter[FRAME_ID_WIDTH] &&
-                            ~compensate && ~remote_fc && resume_counter[FRAME_ID_WIDTH]
-                            && comp_ready;   // hold user payload until clock-comp has resolved
+                            ~compensate && ~remote_fc && resume_counter[FRAME_ID_WIDTH];
 endmodule
 
 module rifl_shiftreg #(

@@ -187,8 +187,7 @@ module RIFL #
 
 //compensate
     logic clock_active;
-    logic comp_ready;              // comp ready-gate (tx_frame_clk); binds to u_clock_compensate via .*
-    logic far_end_up;              // far-end link-up (= &rx_up); re-arm source, binds via .*
+    logic far_end_up;              // far-end link-up (= &rx_up); telemetry re-arm source, binds via .*
     assign far_end_up = &rx_up;
 
     genvar i,j;
@@ -396,7 +395,6 @@ module RIFL #
             .gt_tx_data            (gt_tx_data_core[i]    ),
             .clk_cnt               (frame_clk_cnt         ),
             .compensate            (compensate            ),
-            .comp_ready            (comp_ready            ),
             .tx_state              (tx_state_core[i]      ),
             .rx_up                 (rx_up_core[i]         ),
             .rx_aligned_tx         (rx_aligned_tx_core[i] ),

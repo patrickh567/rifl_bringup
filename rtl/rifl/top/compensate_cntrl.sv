@@ -11,6 +11,21 @@
 //THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 `timescale 1ns / 1ps
+//---------------------------------------------------------------------------------------
+// Clock compensation: FIXED-RATE idle insertion (the standard-protocol scheme, cf. PCIe
+// SKP / Aurora CC / Interlaken skip): unconditionally request one idle-frame insertion
+// every 2^COMP_PERIOD_LOG2 frames, on every link, from the moment the tx clock is
+// active.  1/1024 reserves ~0.1% bandwidth = ~977ppm of compensation capacity, ~10x any
+// plausible refclk-pair mismatch, so the far end's un-flow-controlled RX elastic buffer
+// can never accumulate a backlog -- no measurement, no sign decision, no unprotected
+// startup window.  The receiver discards idle frames before its elastic buffer, so
+// over-insertion is harmless (benign read-side gaps).
+//
+// The previous MEASURED compensation (decide a ppm sign from phase drift, then insert
+// at the measured rate) is retained below as TELEMETRY ONLY: comp_type/comp_locked
+// report the measured drift direction for health monitoring (confirming the real
+// mismatch stays far inside the fixed insertion budget).  It steers nothing.
+//---------------------------------------------------------------------------------------
 module clock_compensate(
     input logic init_clk,
     input logic tx_frame_clk,
@@ -18,11 +33,11 @@ module clock_compensate(
     input logic rst,
     input logic clock_active,
     output logic compensate,
-//status (init_clk domain): ppm sign resolved (locked) + the 2-bit sign type
+//status / telemetry (init_clk domain): measured ppm-sign resolved (locked) + 2-bit sign
     output logic comp_locked,
     output logic [1:0] comp_type,
-//comp ready-gate (tx_frame_clk domain) + far-end re-arm input (= &rx_up, tx_frame_clk)
-    output logic comp_ready,
+//far-end link-up (= &rx_up, tx_frame_clk): gates the telemetry drift window so it only
+//measures while the recovered rx_frame_clk is stable, and re-measures after a link drop
     input  logic far_end_up
 );
     localparam bit [1:0] UNKNOWN = 2'd0;
@@ -30,49 +45,51 @@ module clock_compensate(
     localparam bit [1:0] NO = 2'd2;
     localparam int CNT_WIDTH = 4;
 
+//---- fixed-rate insertion (tx_frame_clk) ----
+    localparam int COMP_PERIOD_LOG2 = 10;          // one idle per 2^10 = 1024 frames (~0.1% BW,
+                                                   //   ~977ppm capacity vs <=~100ppm worst-case
+                                                   //   refclk mismatch -> ~10x margin)
+    logic [COMP_PERIOD_LOG2-1:0] comp_period_cnt;
+
     logic [CNT_WIDTH-1:0] tx_cnt_gray, rx_cnt_gray;
     logic [CNT_WIDTH-1:0] tx_cnt_gray_init_synced, rx_cnt_gray_init_synced;
     logic [CNT_WIDTH-1:0] tx_cnt_init_synced, rx_cnt_init_synced;
-    logic [CNT_WIDTH-1:0] tx_cnt_init_syncedp1;
-    logic [CNT_WIDTH-1:0] rx_cnt_init_syncedp1;
 
     logic [1:0] compensate_type;
-    logic [CNT_WIDTH-1:0] cnt_difference;
     logic [CNT_WIDTH-1:0] cnt_difference_wire;
-    logic cnt_diff_flag;
-    logic [CNT_WIDTH-1:0] compensate_cnt_init;
-    logic compensate_cnt_init_vld;
-    logic compensate_cnt_init_vld_wire;
-    logic compensate_cnt_init_rdy;
-    logic [CNT_WIDTH-1:0] compensate_cnt_tx;
-    logic compensate_cnt_tx_vld;
-    logic [CNT_WIDTH-1:0] compensate_cnt;
 
-//---- drift-based ppm-sign estimator (init_clk).  Measure the tx-rx phase-difference
-//     SLEW over a FIXED window and decide only at the window END, with a threshold
-//     set ABOVE the bounded phase wander.  Over a long window the real frequency
-//     drift accumulates far past the wander, so the sign is unambiguous -- unlike
-//     deciding on the first small excursion, which fires on start-up phase/wander
-//     (that was the failure mode: it wrong-latched ~half the bring-ups). ----
-    localparam int WIN_WIDTH = 23;                 // window = 2^23 init_clk (~84ms @100MHz).  Long enough
-                                                   //   that even a few-ppm real offset slews >= DRIFT_T,
-                                                   //   yet bounded so the shared-refclk links' tiny
-                                                   //   residual never accumulates to threshold.
-    localparam int DRIFT_T   = 32;                 // decide when |windowed slew| >= 32 counts (> wander;
-                                                   //   a >=~4ppm link slews >=32 counts over an 84ms window)
+//---- drift-based ppm-sign estimator (init_clk, TELEMETRY ONLY).  Measure the tx-rx
+//     phase-difference SLEW over a FIXED window and decide only at the window END,
+//     with a threshold set ABOVE the bounded phase wander.  Reports the true drift
+//     direction for links with >= a few ppm of real mismatch; the shared-refclk links
+//     legitimately stay UNKNOWN.  Nothing in the datapath consumes this. ----
+    localparam int WIN_WIDTH = 23;                 // window = 2^23 init_clk (~84ms @100MHz)
+    localparam int DRIFT_T   = 32;                 // decide when |windowed slew| >= 32 counts
     localparam int ACC_WIDTH = 16;                 // signed windowed-slew accumulator
-    localparam int ARM_WIDTH = 24;                 // ready-gate timeout (~168ms) > one window, so real
-                                                   //   links resolve before the no-ppm links time out
-    logic [WIN_WIDTH-1:0]        win_cnt;           // window counter
+    logic [WIN_WIDTH-1:0]        win_cnt;          // window counter
     logic                        win_tick;         // 1-cycle pulse at each window boundary
-    logic [CNT_WIDTH-1:0]        diff_last;         // previous phase difference
+    logic [CNT_WIDTH-1:0]        diff_last;        // previous phase difference
     logic signed [CNT_WIDTH-1:0] step_signed;      // per-cycle signed drift step (wrap-safe)
     logic signed [ACC_WIDTH-1:0] drift_acc;        // windowed integrated (unwrapped) slew
-//---- comp ready-gate + far-end re-arm (init_clk) ----
-    logic [ARM_WIDTH-1:0]  arm_timer;
-    logic                  arm_expired;
-    logic                  comp_ready_init;
-    logic                  far_end_up_synced;
+    logic                        far_end_up_synced;
+
+//---- fixed-rate insertion counter: free-running; request one idle-frame substitution
+//     at each rollover.  Registered output, active whenever the tx clock is active --
+//     including the entire bring-up, so there is no unprotected startup window. ----
+    always_ff @(posedge tx_frame_clk or posedge rst) begin
+        if (rst) begin
+            comp_period_cnt <= '0;
+            compensate      <= 1'b0;
+        end
+        else if (~clock_active) begin
+            comp_period_cnt <= '0;
+            compensate      <= 1'b0;
+        end
+        else begin
+            comp_period_cnt <= comp_period_cnt + 1'b1;
+            compensate      <= (comp_period_cnt == {COMP_PERIOD_LOG2{1'b1}});
+        end
+    end
 
 //gray code counters
     graycntr #(
@@ -111,7 +128,7 @@ module clock_compensate(
         .rst     (rst),
         .din     (rx_cnt_gray),
         .dout    (rx_cnt_gray_init_synced)
-    );    
+    );
 //gray to bin
     gray2bin #(
         .SIZE (CNT_WIDTH)
@@ -124,26 +141,14 @@ module clock_compensate(
     ) u_gray2bin_rx(
     	.gray (rx_cnt_gray_init_synced),
         .bin  (rx_cnt_init_synced)
-    );    
-
-    sync_multi_bit #(
-        .SIZE       (CNT_WIDTH)
-    ) u_sync_comp_cnt(
-        .rst      (rst),
-    	.clk_in   (init_clk),
-        .clk_out  (tx_frame_clk),
-        .din      (compensate_cnt_init),
-        .din_vld  (compensate_cnt_init_vld),
-        .din_rdy  (compensate_cnt_init_rdy),
-        .dout     (compensate_cnt_tx),
-        .dout_vld (compensate_cnt_tx_vld),
-        .dout_rdy (~(|compensate_cnt))
     );
 
+    assign cnt_difference_wire = tx_cnt_init_synced - rx_cnt_init_synced;
 
-    // Sign decision: evaluate the windowed slew only at the window boundary, so the
-    // decision reflects real frequency drift (accumulated over the whole window),
-    // not a transient wander excursion.  Re-arms to UNKNOWN on far-end reset.
+    // Sign decision (telemetry): evaluate the windowed slew only at the window
+    // boundary, so the reading reflects real frequency drift accumulated over the
+    // whole window, not a transient wander excursion.  Re-arms to UNKNOWN on far-end
+    // link-down so a reconnect re-measures cleanly.
     always_ff @(posedge init_clk or posedge rst) begin
         if (rst)
             compensate_type <= UNKNOWN;
@@ -151,58 +156,12 @@ module clock_compensate(
             compensate_type <= UNKNOWN;
         else if (compensate_type == UNKNOWN && win_tick) begin
             if (drift_acc >= DRIFT_T)
-                compensate_type <= YES;     // net slew up   over the window -> tx faster -> insert comp
+                compensate_type <= YES;     // net slew up   over the window -> tx faster than rx
             else if (drift_acc <= -DRIFT_T)
-                compensate_type <= NO;       // net slew down over the window -> rx faster -> no insertion
+                compensate_type <= NO;       // net slew down over the window -> rx faster than tx
             // else |slew| < threshold: no resolvable ppm this window -> stay UNKNOWN
         end
     end
-
-    always_ff @(posedge init_clk or posedge rst) begin
-        if (rst) begin
-            cnt_difference <= {CNT_WIDTH{1'b0}};
-            compensate_cnt_init <= {CNT_WIDTH{1'b0}};
-            compensate_cnt_init_vld <= 1'b0;
-        end
-        else if (~clock_active | ~far_end_up_synced) begin
-            cnt_difference <= {CNT_WIDTH{1'b0}};
-            compensate_cnt_init <= {CNT_WIDTH{1'b0}};
-            compensate_cnt_init_vld <= 1'b0;
-        end
-        else if (compensate_type == YES) begin
-            if (compensate_cnt_init_rdy && compensate_cnt_init_vld_wire) begin
-                cnt_difference <= cnt_difference_wire;
-                compensate_cnt_init <= cnt_difference_wire - cnt_difference;
-            end
-            if (compensate_cnt_init_rdy)
-                compensate_cnt_init_vld <= compensate_cnt_init_vld_wire;
-        end
-    end
-
-    always_ff @(posedge tx_frame_clk or posedge rst) begin
-        if (rst)
-            compensate_cnt <= {CNT_WIDTH{1'b0}};
-        else if (~clock_active)
-            compensate_cnt <= {CNT_WIDTH{1'b0}};
-        else if (~(|compensate_cnt)) begin
-            if (compensate_cnt_tx_vld)
-                compensate_cnt <= compensate_cnt_tx;
-        end
-        else
-            compensate_cnt <= compensate_cnt - 1'b1;
-    end
-
-    always_ff @(posedge tx_frame_clk) begin
-        compensate <= |compensate_cnt;
-    end
-
-    //sometimes cnt_difference_wire can be smaller than cnt_difference even if compensate type is yes
-    //leading to a very high difference between cnt_difference_wire and cnt_difference
-    //it doesn't reflect the real difference
-    assign compensate_cnt_init_vld_wire = cnt_difference_wire != cnt_difference && (cnt_difference_wire-cnt_difference) < 3'd4;
-    assign cnt_difference_wire = tx_cnt_init_synced - rx_cnt_init_synced;
-    assign tx_cnt_init_syncedp1 = tx_cnt_init_synced + 1'b1;
-    assign rx_cnt_init_syncedp1 = rx_cnt_init_synced + 1'b1;
 
 //---- windowed drift accumulator: sum the per-cycle signed phase-difference step
 //     over a fixed window (telescopes to the unwrapped total slew), restarting the
@@ -237,31 +196,17 @@ module clock_compensate(
         end
     end
 
-//---- far-end link-up (CDC &rx_up into init_clk).  The whole drift measurement +
-//     ready-gate is gated on this LEVEL: it runs only while the link is up (stable
-//     recovered rx_frame_clk) and holds in reset otherwise, so the bring-up transient
-//     never corrupts a window and a link-down re-measures cleanly on re-up. ----
+//---- far-end link-up (CDC &rx_up into init_clk).  The telemetry measurement is gated
+//     on this LEVEL: it runs only while the link is up (stable recovered rx_frame_clk)
+//     and holds in reset otherwise, so the bring-up transient never corrupts a window
+//     and a link-down re-measures cleanly on re-up. ----
     sync_signle_bit #(.SIZE(1), .N_STAGE(3)) u_sync_far_end_up (
         .clk_in (tx_frame_clk), .clk_out(init_clk), .rst(rst),
         .din    (far_end_up),   .dout   (far_end_up_synced));
 
-//---- ready-gate: release payload once the sign is resolved, or after a timeout so
-//     the shared-refclk links (whose counters never diverge -> sign stays UNKNOWN)
-//     are not held forever; the timeout is qualified on the link being up. ----
-    always_ff @(posedge init_clk or posedge rst) begin
-        if (rst)                        arm_timer <= '0;
-        else if (~clock_active | ~far_end_up_synced) arm_timer <= '0;
-        else if (~arm_expired)          arm_timer <= arm_timer + 1'b1;
-    end
-    assign arm_expired     = &arm_timer;
-    assign comp_ready_init = (compensate_type != UNKNOWN) | (arm_expired & far_end_up_synced);
-    sync_signle_bit #(.SIZE(1), .N_STAGE(3)) u_sync_comp_ready (
-        .clk_in (init_clk),       .clk_out(tx_frame_clk), .rst(rst),
-        .din    (comp_ready_init),.dout   (comp_ready));
-
-//status outputs (init_clk domain): comp_type is the ppm-sign FSM state; comp_locked
-//is high once the sign has resolved out of UNKNOWN (it drops with compensate_type on
-//rst/~clock_active, and later on the far-end re-arm).
+//status outputs (init_clk domain): comp_type is the measured ppm-sign FSM state;
+//comp_locked is high once the sign has resolved out of UNKNOWN (drops on rst /
+//~clock_active / far-end link-down).
     assign comp_type   = compensate_type;
     assign comp_locked = (compensate_type != UNKNOWN);
 
